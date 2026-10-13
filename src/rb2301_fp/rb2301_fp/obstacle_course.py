@@ -1,3 +1,6 @@
+import argparse
+import configparser
+import math
 import os
 import numpy as np
 import rclpy
@@ -11,6 +14,43 @@ from sensor_msgs.msg import LaserScan
 
 np.set_printoptions(2, suppress=True, threshold=np.inf) # Print numpy arrays to specified d.p., suppress scientific notation and do not truncate
 set_logger_level("obstaclecourse", level=LoggingSeverity.INFO) # Configure to either LoggingSeverity.INFO or LoggingSeverity.DEBUG  
+
+
+_PACKAGE_DIR = os.path.dirname(os.path.realpath(__file__))
+
+def wrap_deg(angle:float) -> float:
+    '''Wrap an angle in degrees into [-180, 180).'''
+    return (angle + 180.0) % 360.0 - 180.0
+
+def optitrack_to_maze(x:float, y:float, heading_deg:float, frame:dict) -> tuple:
+    '''Optitrack-frame pose (x, y, heading in degrees) -> CA2 maze-frame pose (see optitrack_variables.config).'''
+    dx, dy = x - frame["origin_x"], y - frame["origin_y"]
+    r = math.radians(frame["rotation_deg"])
+    c, s = math.cos(r), math.sin(r)
+    return (c * dx + s * dy, -s * dx + c * dy,
+            wrap_deg(heading_deg - frame["rotation_deg"] - frame["heading_offset_deg"]))
+
+def maze_to_course(x:float, y:float, heading_deg:float, course:dict) -> tuple:
+    '''CA2 maze-frame pose -> final-project course frame (origin/rotation of the course in the maze frame, [course] in the config).'''
+    dx, dy = x - course["origin_x"], y - course["origin_y"]
+    r = math.radians(course["rotation_deg"])
+    c, s = math.cos(r), math.sin(r)
+    return (c * dx + s * dy, -s * dx + c * dy, wrap_deg(heading_deg - course["rotation_deg"]))
+
+def load_frame(robot_number:int) -> tuple:
+    '''Read optitrack_variables.config: returns (frame, course) for this robot.'''
+    parser = configparser.ConfigParser()
+    path = os.path.join(_PACKAGE_DIR, "optitrack_variables.config")
+    if not parser.read(path):
+        raise FileNotFoundError(f"Could not read {path}")
+    frame = {k: parser.getfloat("frame", k) for k in ("origin_x", "origin_y", "rotation_deg")}
+    raw = parser.get("frame", "heading_offset_deg", fallback="auto").strip().lower()
+    # Rigid bodies are created facing +y of the maze frame, so Motive's zero heading is maze +y (90 deg)
+    frame["heading_offset_deg"] = wrap_deg(-(frame["rotation_deg"] + 90.0)) if raw == "auto" else float(raw)
+    if parser.has_section("heading_offsets") and parser.has_option("heading_offsets", str(robot_number)):
+        frame["heading_offset_deg"] = parser.getfloat("heading_offsets", str(robot_number))
+    course = {k: parser.getfloat("course", k, fallback=0.0) for k in ("origin_x", "origin_y", "rotation_deg")}
+    return frame, course
 
 class LidarNode(Node):
     def __init__(self):
@@ -28,11 +68,15 @@ class LidarNode(Node):
 
 class ObstacleCourseNode(Node):
     '''Node to navigate obstacle course, using pose from either gazebo odometer or optitrack and lidar scan data'''
-    def __init__(self, is_simulation:bool=True):
+    def __init__(self, is_simulation:bool=True, calibrate:bool=False):
         super().__init__('obstaclecourse')
         self.get_logger().info("Starting ObstacleCourseNode")
 
         self.is_simulation = is_simulation
+        self.calibrate = calibrate # Real robot: only print poses, never drive
+        self.raw_pose = None # Pose exactly as Optitrack reported it (real robot only)
+        self.frame = self.course = None
+        self._ticks = 0
 
         if is_simulation:
             self.max_translate_velocity = 1.4
@@ -49,6 +93,7 @@ class ObstacleCourseNode(Node):
             # On the Bingda robots ROS_DOMAIN_ID is the robot's number, so the Optitrack topic is picked automatically
             domain = os.environ.get("ROS_DOMAIN_ID", "")
             self.robot_number = int(domain) if domain.isdigit() and 1 <= int(domain) <= 99 else 3
+            self.frame, self.course = load_frame(self.robot_number)
             self.get_logger().info(f"Reading pose from /vrpn_mocap/bingda_{self.robot_number:03d}/pose")
 
             self.map_sub = self.create_subscription( 
@@ -81,8 +126,15 @@ class ObstacleCourseNode(Node):
         This callback will run everytime the rclpy executor spins'''
         x, y = msg.pose.position.x, msg.pose.position.y
         heading = np.rad2deg(self.yaw_from_quaternion(msg.pose.orientation))
+        self.raw_pose = np.array((x,y,heading))
+        x, y, heading = optitrack_to_maze(x, y, heading, self.frame) # CA2 maze frame, see optitrack_variables.config
         self.pose = np.array((x,y,heading))
         return self.pose
+
+    def to_course(self, pose=None):
+        '''Convert a pose [x, y, heading] (default: self.pose) from the CA2 maze frame to the final-project course frame. Optional; see [course] in optitrack_variables.config'''
+        pose = self.pose if pose is None else pose
+        return np.array(maze_to_course(pose[0], pose[1], pose[2], self.course)) if self.course else np.array(pose)
 
     def odometer_callback(self, msg):
         '''Callback to calculate 2D pose info from Gazebo odomoter. Pose info includes x and y coordinates, as well as heading in degrees.
@@ -107,7 +159,14 @@ class ObstacleCourseNode(Node):
         if self.pose is None:
             print("No pose detected")
             return # Does not run if no pose received from Odom or Optitrack
-        
+
+        if self.calibrate and self.raw_pose is not None:
+            self._ticks += 1
+            if self._ticks % 10 == 0: # twice a second
+                ox, oy, oh = self.raw_pose
+                self.get_logger().info(f"optitrack ({ox:+.3f}, {oy:+.3f}, {oh:+7.1f} deg)  ->  maze ({self.pose[0]:+.3f}, {self.pose[1]:+.3f}, {self.pose[2]:+7.1f} deg)")
+            return # Calibration mode: look, don't drive
+
         ###### INSERT CODE HERE ######
         self.get_logger().info(f"Pose: {self.pose}")
         self.move_2D(0.1)
@@ -115,8 +174,11 @@ class ObstacleCourseNode(Node):
                 
 
 def main(args=None):
+    arg_parser = argparse.ArgumentParser(description="RB2301 final project")
+    arg_parser.add_argument('--calibrate', action='store_true', help="Real robot: only print the Optitrack pose and the maze-frame pose twice a second, never drive")
+    cli_args, ros_args = arg_parser.parse_known_args(args=args)
     print("Starting obstacle course")
-    rclpy.init(args=args)
+    rclpy.init(args=ros_args)
 
     # Use lidar scan length to determine if in simulation or not
     lidar = LidarNode()
@@ -126,7 +188,7 @@ def main(args=None):
     lidar.destroy_node()
 
     # Start spinning the obstacle node and only stop once SystemExit error is raised within the node callback
-    obstacle = ObstacleCourseNode(is_simulation)
+    obstacle = ObstacleCourseNode(is_simulation, cli_args.calibrate)
     try:
         rclpy.spin(obstacle)
     except SystemExit:
