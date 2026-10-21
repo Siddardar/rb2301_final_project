@@ -76,17 +76,18 @@ def modify_sdf_file():
 
         # Edit obstacles
         elif element.tag == 'actor':
+            trajectory = element.find('script').find('trajectory') # waypoints of this obstacle
             if randomise_obstacle_speed:
                 random_time = np.random.random()*4.0 + 2.0 # Random half-period between [2, 5] seconds
-                element[2][3][1][0].text = str(random_time) # Edit first waypoint time
-                element[2][3][2][0].text = str(random_time*2) # 2nd waypoint time
+                trajectory[1][0].text = str(random_time) # Edit first waypoint time
+                trajectory[2][0].text = str(random_time*2) # 2nd waypoint time
                 
             if randomise_zigzag_size:
                 for waypoint_idx in range(3):
-                    waypoint_pose = element[2][3][waypoint_idx][1].text.split(' ')
+                    waypoint_pose = trajectory[waypoint_idx][1].text.split(' ')
                     waypoint_pose[0] = str(float(waypoint_pose[0]) + x_offset)
                     waypoint_pose[1] = str(float(waypoint_pose[1]) + y_offset)
-                    element[2][3][waypoint_idx][1].text = ' '.join(waypoint_pose)  
+                    trajectory[waypoint_idx][1].text = ' '.join(waypoint_pose)  
 
     if spawn_static_obstacles:
         static_obstacle_positions = np.array([

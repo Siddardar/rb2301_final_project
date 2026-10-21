@@ -248,7 +248,6 @@
     </include>
 
     <actor name="obstacle_1">
-      <static>false</static>
       <link name="obstacle_link_1">
         <visual name="obstacle_visual_1">
           <geometry>
@@ -285,7 +284,6 @@
     </actor>
 
     <actor name="obstacle_2">
-      <static>false</static>
       <link name="obstacle_link_2">
         <visual name="obstacle_visual_2">
           <geometry>
