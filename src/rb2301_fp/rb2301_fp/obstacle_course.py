@@ -108,13 +108,24 @@ class ObstacleCourseNode(Node):
 
         self.pose = None
 
+        self.static_map = None
+        self.max_range = None
+
     def sub_scan_callback(self, msg):
         """Scan subscriber"""
-        if len(msg.ranges) <= 360:
-            self.last_scan = np.array(msg.ranges)
-        else:
-            self.last_scan = np.array(msg.ranges)[::2] 
+        self.last_scan = np.array(msg.ranges)
 
+        if self.static_map is None:
+            self.static_map = StaticMap(self.pose[0], self.pose[1])
+            self.max_range = StaticMap.CELL_SIZE / msg.angle_increment
+
+        ranges = self.last_scan.copy()
+        ranges[ranges < msg.range_min] = np.nan
+        heading = np.deg2rad(self.pose[2])
+
+        angles = heading + msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
+        self.static_map.update(self.pose[:2], angles, ranges, self.max_range)        
+        
     def yaw_from_quaternion(self, q):
         '''Returns yaw angle (in rad) for orientation based on given quaternion input q'''
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
@@ -172,6 +183,92 @@ class ObstacleCourseNode(Node):
         self.move_2D(0.1)
         ###### INSERT CODE HERE ######
                 
+class StaticMap:
+    CELL_SIZE = 0.025 # 2.5 cm square cell
+    GROW_MARGIN = 1.0 # 1m of unknown space added when map grows
+    
+    L_OCC = 0.85
+    L_FREE = -0.4
+    L_MIN, L_MAX = -4.0, 4.0
+    
+    OCCUPIED = 1.0
+    FREE = -1.0
+
+    def __init__(self, start_x, start_y):
+        """
+           y
+        4.0 ┌──────┬──────┬──────┬──────┐
+            │[2,0] │[2,1] │[2,2] │[2,3] │   row 2
+        3.0 ├──────┼──────┼──────┼──────┤
+            │[1,0] │[1,1] │[1,2] │[1,3] │   row 1
+        2.0 ├──────┼──────┼──────┼──────┤
+            │[0,0] │[0,1] │[0,2] │[0,3] │   row 0
+        1.0 └──────┴──────┴──────┴──────┘
+            2.0    3.0    4.0    5.0    6.0  x
+            col 0  col 1  col 2  col 3
+        """
+        self.occupancy_map = np.zeros((1, 1))
+        self.origin = np.array((start_x, start_y))
+
+    def to_cells(self, xy: np.ndarray) -> np.ndarray:
+        """
+        World coordinate to cell coordiate. 
+        NOTE: since input is x, y this fn returns (col, row) that u need to flip when indexing
+        """
+        return np.floor((xy - self.origin) / self.CELL_SIZE).astype(int)
+
+    def to_flat_cells(self, xy:np.ndarray) -> np.ndarray:
+        """
+        returns idx of cell if matrix is flattened
+        """
+    
+        cells = self.to_cells(xy)
+
+        return np.unique(cells[:, 1] * self.occupancy_map.shape[1] + cells[:, 0])
+
+    def grow_map_to_fit(self, xy: np.ndarray):
+        cells = self.to_cells(xy)
+        rows, cols = self.occupancy_map.shape
+
+        below = np.maximum(-cells.min(axis = 0), 0) # cells needed before row 0, col 0
+        above = np.maximum(cells.max(axis=0) - (cols - 1, rows - 1), 0) # cells need after last row, last col
+
+        if not (below.any() or above.any()):
+            # no need to grow map
+            return 
+
+        margin = int(self.GROW_MARGIN / self.CELL_SIZE)
+
+        before = np.where(below > 0, below + margin, 0)
+        after = np.where(above > 0, above + margin, 0)
+
+        self.occupancy_map = np.pad(self.occupancy_map, ((before[1], after[1]), (before[0], after[0])))
+
+        self.origin = self.origin - before * self.CELL_SIZE
+
+    def update(self, lidar_xy: np.ndarray, angles: np.ndarray, ranges: np.ndarray, max_range: float):
+        valid = np.isfinite(ranges)
+        angles, ranges = angles[valid], ranges[valid]
+
+        is_hit = ranges <= max_range
+        ranges = np.minimum(ranges, max_range)
+        directions = np.stack((np.cos(angles), np.sin(angles)), axis = 1)
+        ends = lidar_xy + ranges[:, None] * directions
+
+        self.grow_map_to_fit(np.vstack((lidar_xy, ends)))
+
+        steps = np.arange(0.0, max_range, self.CELL_SIZE / 2)
+        before_end = steps[None, :] < ranges[:, None] - self.CELL_SIZE
+
+        samples = lidar_xy + steps[None, :, None] * directions[:, None, :]
+        free = self.to_flat_cells(samples[before_end])
+        hits = self.to_flat_cells(ends[is_hit])
+
+        grid = self.occupancy_map.reshape(-1)
+        grid[free] += self.L_FREE
+        grid[hits] += self.L_OCC
+
+        np.clip(grid, self.L_MIN, self.L_MAX, out = grid)
 
 def main(args=None):
     arg_parser = argparse.ArgumentParser(description="RB2301 final project")
