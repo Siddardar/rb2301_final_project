@@ -232,8 +232,8 @@ class ObstacleCourseNode(Node):
         self.state = EXPLORE
         self.path = self.target = None # current path (world points) and where it leads
         self.to_end = False # True once nothing is left to explore and the target is the end of the course
+        self.progress = -math.inf # farthest the robot has been from the start, as path cost. New targets are beyond it
         self.plan_time = -math.inf # when the path was last planned
-        self.busy = [] # world points on moving obstacles' paths where no window was long enough to cross
 
     def sub_scan_callback(self, msg):
         """Scan subscriber. Also adds the scan to the map"""
@@ -342,12 +342,11 @@ class ObstacleCourseNode(Node):
             self.follow(path)
             return
         self.state = HOLD
-        self.was_blocked, self.clear_since, self.windows = False, None, []
+        self.seen_blocked = False
         self.get_logger().info(f"{self.state}: moving obstacle ahead")
 
     def hold(self):
-        '''Approach a moving obstacle's sweep zone and face it. Meanwhile, time how long the crossing stays clear each
-        time the obstacle leaves it, and cross at the start of a window that should be long enough.
+        '''Approach a moving obstacle's sweep zone and face it, then cross once the obstacle has moved out of the way.
         Everything is recomputed every tick, because the sweep zone grows while the robot watches'''
         self.replan_if_due()
         path = None if self.path is None else self.path_ahead()
@@ -371,44 +370,24 @@ class ObstacleCourseNode(Node):
             return
 
         blocked = self.crossing_blocked(path[start:end])
-        window_started = self.was_blocked and not blocked
-        if blocked != self.was_blocked:
-            now = self.get_clock().now().nanoseconds * 1e-9
-            if blocked and self.clear_since is not None:
-                self.windows.append(now - self.clear_since) # a clear window just ended
-            if not blocked:
-                self.clear_since = now
-            self.was_blocked = blocked
-
-        crossing_length = np.sum(np.linalg.norm(np.diff(path[start - 1:out + 1], axis=0), axis=1))
-        cross_time = crossing_length / MAX_SPEED + MAX_SPEED / (2 * MAX_ACCEL) # + time lost ramping up
-        # The windows repeat every cycle, and the last two make up one cycle. If neither is long enough, waiting here
-        # can't help. Near the ends of the obstacle's path the windows are longer, so try crossing further along it
-        if len(self.windows) >= 2 and max(self.windows[-2:]) < cross_time:
-            self.busy.append(path[(start + end) // 2])
-            self.state = EXPLORE
-            self.plan_time = -math.inf # replan at once, around this spot
-            self.get_logger().info(f"{self.state}: windows {self.windows[-2]:.1f} s and {self.windows[-1]:.1f} s, "
-                                   f"need {cross_time:.1f} s, crossing elsewhere")
-            return
-
+        self.seen_blocked |= blocked
         if not self.follow(path[:start]):
             return # still driving to the hold point, just outside the zone's reach
-        # Face the far end of the crossing. It follows the sweep zone, so unlike the carrot it barely moves when the path
-        # is replanned, and the robot doesn't keep turning (and skipping scans) while it times the windows
+        # Cross as soon as the obstacle is out of the way. Having just left, it is moving away, so the crossing behind
+        # it stays clear longest. A crossing that has been clear since the robot arrived may have it on its way back
+        if self.seen_blocked and not blocked:
+            self.cross_path = path[:out + 1]
+            self.state = CROSS
+            self.get_logger().info(f"{self.state}: moving obstacle out of the way")
+            return
+        # Face the far end of the crossing while waiting. It follows the sweep zone, so unlike the carrot it barely
+        # moves when the path is replanned, and the robot doesn't keep turning (and skipping scans)
         dx, dy = path[out] - self.pose[:2]
         alpha = math.radians(wrap_deg(math.degrees(math.atan2(dy, dx)) - self.pose[2]))
         if abs(alpha) > ALIGN_TOL:
             self.turn_in_place(alpha)
             return
         self.drive(0.0, 0.0)
-
-        # The obstacle repeats its motion, so the window one cycle ago, two windows back, shows how long the one
-        # starting now will last. Near one end of the obstacle's path, windows alternate long and short
-        if window_started and len(self.windows) >= 2 and self.windows[-2] >= cross_time:
-            self.cross_path = path[:out + 1]
-            self.state = CROSS
-            self.get_logger().info(f"{self.state}: expecting {self.windows[-2]:.1f} s clear, need {cross_time:.1f} s")
 
     def cross(self):
         '''Drive through the crossing, or out of reach, without stopping. Then go back to exploring'''
@@ -429,12 +408,10 @@ class ObstacleCourseNode(Node):
         return self.path[np.argmin(np.linalg.norm(self.path - self.pose[:2], axis=1)):]
 
     def replan(self):
-        '''Plan to the current target if it is still worth reaching, otherwise to the nearest frontier.
-        With no frontier left, head for the end of the course: the reachable cell farthest from the start.
-        Sets self.path (world points) and self.target, both None if nothing can be reached'''
+        '''Plan to the current target if it is still worth reaching, otherwise to the nearest frontier farther along the
+        course than the robot has been. With no such frontier, head for the end of the course: the reachable cell
+        farthest from the start. Sets self.path (world points) and self.target, both None if nothing can be reached'''
         cost, blocked, reach = self.course_map.planning_grids()
-        for point in self.busy: # paths go round places where no window was long enough, a robot's width either side
-            cost[self.course_map.within(point, ROBOT_WIDTH)] = INFLATED
         allowed = self.course_map.ahead(self.start) & ~blocked & ~reach # where a target may be
         frontier = self.course_map.frontier(allowed)
         start = self.course_map.to_cell(self.pose[:2])
@@ -444,17 +421,31 @@ class ObstacleCourseNode(Node):
             if frontier[goal] or (self.to_end and not frontier.any()):
                 cells = plan_to(cost, start, goal)
         if cells is None:
+            # A new target must be farther from the start, by path cost, than the robot has ever been, so the robot never
+            # turns back to somewhere it has already passed. A robot's length of slack, as costs change with the map
+            from_start = self.cost_from_start(cost)
+            self.progress = max(self.progress, from_start[start])
+            onward = from_start > self.progress - ROBOT_LENGTH / CourseMap.CELL_SIZE
+            frontier &= onward
             cells = plan_path(cost, start, frontier) if frontier.any() else None
             self.to_end = False
-        if cells is None:
-            _, _, g = search(cost, self.course_map.to_cell(self.start[:2]))
-            candidates = ((self.course_map.occupancy_map < CourseMap.FREE) & allowed).tolist()
-            end = max((cell for cell in g if candidates[cell[0]][cell[1]]), key=g.get, default=None)
-            cells = None if end is None else plan_to(cost, start, end)
-            self.to_end = True
+            if cells is None:
+                candidates = (self.course_map.occupancy_map < CourseMap.FREE) & allowed & onward
+                if candidates.any():
+                    end = np.unravel_index(np.argmax(np.where(candidates, from_start, -np.inf)), cost.shape)
+                    cells = plan_to(cost, start, (int(end[0]), int(end[1])))
+                self.to_end = True
         self.path = None if cells is None else self.course_map.cells_to_world(np.array(cells))
         self.target = None if cells is None else self.path[-1]
         self.get_logger().debug(f"Planned in {self.get_clock().now().nanoseconds * 1e-9 - self.plan_time:.2f} s")
+
+    def cost_from_start(self, cost:np.ndarray) -> np.ndarray:
+        '''Path cost from the course start to every cell, -inf where it can't reach'''
+        _, _, g = search(cost, self.course_map.to_cell(self.start[:2]))
+        from_start = np.full(cost.shape, -np.inf)
+        cells = np.array(list(g))
+        from_start[cells[:, 0], cells[:, 1]] = list(g.values())
+        return from_start
 
     def find_crossing(self, path:np.ndarray):
         '''(start, end) indices of the first stretch of path within SWEEP_CLEARANCE of the sweep zone, or None'''
@@ -671,13 +662,6 @@ class CourseMap:
         y = self.origin[1] + (np.arange(rows) + 0.5) * self.CELL_SIZE
         heading = np.deg2rad(pose[2])
         return (x[None, :] - pose[0]) * np.cos(heading) + (y[:, None] - pose[1]) * np.sin(heading) > 0
-
-    def within(self, point:np.ndarray, radius:float) -> np.ndarray:
-        '''True for cells whose centre is within radius of a world point'''
-        rows, cols = self.occupancy_map.shape
-        x = self.origin[0] + (np.arange(cols) + 0.5) * self.CELL_SIZE
-        y = self.origin[1] + (np.arange(rows) + 0.5) * self.CELL_SIZE
-        return (x[None, :] - point[0]) ** 2 + (y[:, None] - point[1]) ** 2 < radius ** 2
 
     def frontier(self, allowed:np.ndarray) -> np.ndarray:
         '''Free cells next to an unknown cell, inside allowed'''

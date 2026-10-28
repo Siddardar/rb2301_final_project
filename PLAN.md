@@ -472,6 +472,17 @@ out and again on its way back.
 came back before the robot was across. Timing the windows needs no period,
 speed, or motion model, and it works for any obstacle that repeats its motion.
 
+**When no window is long enough.** The last two windows make up one full cycle,
+the long one and the short one. If neither is as long as `cross_time`, waiting at
+this spot can't help. The robot records the middle of the crossing, goes back to
+`EXPLORE`, and replans at once. From then on, cells within a robot's width of that
+point cost `INFLATED`, so the new path crosses the obstacle's path somewhere else.
+The windows are longest near the ends of the obstacle's path, where its two
+passes merge into one, so each new try moves the crossing toward an end. In
+the simulation, with the obstacle taking 2.06 s from end to end, crossings in
+the middle 0.7 m of its 1.2 m path never had a window longer than 2.09 s. Only
+lanes within about 0.2 m of either end did.
+
 ### 6.3 Cross
 
 In `CROSS`, the robot follows the path through the crossing and stops
@@ -518,7 +529,12 @@ The turn rate is `TURN_GAIN × alpha`, between `MIN_TURN` and `MAX_TURN`.
 
 **Reverse.** During a crossing or an escape (section 6), if the carrot is more
 than 90° off the heading, the robot backs toward it with pure pursuit from the
-rear instead of turning around.
+rear instead of turning around. If the carrot is more than 60° off the rear as
+well, the robot first turns in place until its rear faces the carrot, as it does
+when driving forward. Without this, a carrot about 90° to the side scales both
+the speed and the turn rate by about cos 90° ≈ 0, and the robot stops dead. In
+the simulation it sat at 5 mm/s in front of the moving obstacles in the middle
+of an escape.
 
 **Speed.** The robot drives at up to `MAX_SPEED` (0.3 m/s). Forward speed rises
 by at most `MAX_ACCEL` (0.5 m/s²) so the robot doesn't jerk, but drops at once,
@@ -650,7 +666,8 @@ The robot runs ROS Foxy, so Python 3.8. `np.nan_to_num(posinf=...)` needs numpy
 
 These limits are accepted to keep the code simple:
 
-- If no window is ever long enough, the robot waits at the hold point.
+- If no window is long enough anywhere along a moving obstacle's path, the
+  robot runs out of places to try and stands still on the near side.
 - The sweep zone is learned as the obstacle moves. If the robot reaches a track
   before it has seen the obstacle cover the part next to its path, it can stop
   closer than `SWEEP_CLEARANCE` and has to escape once the zone grows. In
