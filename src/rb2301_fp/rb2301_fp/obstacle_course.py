@@ -1,5 +1,6 @@
 import argparse
 import configparser
+import heapq
 import math
 import os
 import numpy as np
@@ -51,6 +52,110 @@ def load_frame(robot_number:int) -> tuple:
         frame["heading_offset_deg"] = parser.getfloat("heading_offsets", str(robot_number))
     course = {k: parser.getfloat("course", k, fallback=0.0) for k in ("origin_x", "origin_y", "rotation_deg")}
     return frame, course
+
+# Robot size, from CA1
+ROBOT_WIDTH = 0.225 # m
+ROBOT_LENGTH = 0.289 # m
+SWEEP_CLEARANCE = math.hypot(ROBOT_WIDTH, ROBOT_LENGTH) / 2 # m. Any closer to a moving obstacle and the robot can touch it, whatever its heading
+
+# Driving
+DT = 0.05 # s, timer period
+MAX_SPEED = 0.3 # m/s, the real robot's limit
+MAX_ACCEL = 0.5 # m/s^2. Speed ramps up at most this fast, but drops at once
+MAX_TURN = 0.6 # rad/s, move_2D's turn limit on the real robot
+MIN_TURN = 0.3 # rad/s. From CA2: the real robot doesn't turn any slower than this
+TURN_GAIN = 1.5 # rad/s of turn per rad of heading error, when turning in place
+LOOKAHEAD = 0.2 # m, how far along the path the carrot is
+TURN_IN_PLACE = math.radians(60) # turn in place when the carrot is further off the heading than this
+ALIGN_TOL = math.radians(3) # heading errors smaller than this count as zero
+ARRIVE_TOL = 0.05 # m, how close to the end of a path counts as arriving
+STOP_DISTANCE = 0.1 # m. Stop if a LiDAR return is this close in front of the robot's front edge
+REPLAN_PERIOD = 1.0 # s
+
+# Planning
+INFLATED = 1000.0 # cost of a cell within half the robot's width of an occupied cell
+CLEARANCE_WEIGHT = 4.0 # extra cost of a cell right next to an inflated one. Keeps paths in the middle of gaps
+EIGHT_NEIGHBOURS = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc]
+STEPS = [(dr, dc, math.hypot(dr, dc)) for dr, dc in EIGHT_NEIGHBOURS] # (row, col) step and its length in cells
+
+EXPLORE, HOLD, CROSS = "EXPLORE", "HOLD", "CROSS"
+
+def dilate(mask:np.ndarray, offsets) -> np.ndarray:
+    '''Grow the True cells of mask: a cell becomes True if a True cell is any (row, col) offset away from it'''
+    grown = mask.copy()
+    rows, cols = mask.shape
+    for dr, dc in offsets:
+        # grown[r + dr, c + dc] |= mask[r, c], for every cell at once
+        grown[max(dr, 0):rows + min(dr, 0), max(dc, 0):cols + min(dc, 0)] |= \
+            mask[max(-dr, 0):rows + min(-dr, 0), max(-dc, 0):cols + min(-dc, 0)]
+    return grown
+
+def disk(radius:float, cell_size:float) -> list:
+    '''(row, col) offsets of every cell within radius, rounded up to whole cells'''
+    r = int(np.ceil(radius / cell_size))
+    return [(dr, dc) for dr in range(-r, r + 1) for dc in range(-r, r + 1) if dr * dr + dc * dc <= r * r]
+
+def search(cost:np.ndarray, start:tuple, goal_mask:np.ndarray=None, goal:tuple=None) -> tuple:
+    '''Lowest-cost search over 8-connected cells from start (row, col).
+    With goal_mask, it stops at the first True cell it reaches: the nearest one by path cost. Without it, it reaches
+    every cell it can. With goal (row, col) it is A*, with the octile distance to goal as the heuristic, otherwise Dijkstra.
+    A path can leave an inflated cell but never enter one from a cell that isn't, so a robot that has drifted
+    close to a wall can still get out.
+    Returns (reached, parent, g): the goal cell reached (None if none), and each cell's parent and cost from start'''
+    cost = cost.copy()
+    cost[[0, -1], :] = np.inf # block the border, so neighbours never fall outside the grid
+    cost[:, [0, -1]] = np.inf
+    cost = cost.tolist() # lists are faster than numpy arrays for one cell at a time
+    if goal_mask is not None:
+        goal_mask = goal_mask.tolist()
+
+    def heuristic(r, c):
+        if goal is None:
+            return 0.0
+        dr, dc = abs(r - goal[0]), abs(c - goal[1])
+        return max(dr, dc) + (math.sqrt(2) - 1) * min(dr, dc)
+
+    g = {start: 0.0} # lowest cost found so far from start to each cell
+    parent = {start: None}
+    heap = [(heuristic(*start), start)]
+    closed = set()
+    while heap:
+        _, cell = heapq.heappop(heap)
+        if cell in closed:
+            continue
+        closed.add(cell)
+        r, c = cell
+        if goal_mask is not None and goal_mask[r][c]:
+            return cell, parent, g
+        inflated = cost[r][c] >= INFLATED
+        for dr, dc, length in STEPS:
+            nr, nc = r + dr, c + dc
+            step_cost = cost[nr][nc]
+            if step_cost == math.inf or (step_cost >= INFLATED and not inflated):
+                continue
+            new_g = g[cell] + length * step_cost
+            if new_g < g.get((nr, nc), math.inf):
+                g[(nr, nc)] = new_g
+                parent[(nr, nc)] = cell
+                heapq.heappush(heap, (new_g + heuristic(nr, nc), (nr, nc)))
+    return None, parent, g
+
+def plan_path(cost:np.ndarray, start:tuple, goal_mask:np.ndarray, goal:tuple=None):
+    '''Path from start to the nearest True cell of goal_mask as a list of (row, col), or None if none can be reached'''
+    cell, parent, _ = search(cost, start, goal_mask, goal)
+    if cell is None:
+        return None
+    path = []
+    while cell is not None:
+        path.append(cell)
+        cell = parent[cell]
+    return path[::-1]
+
+def plan_to(cost:np.ndarray, start:tuple, goal:tuple):
+    '''A* path from start to goal, both (row, col), or None if goal can't be reached'''
+    goal_mask = np.zeros(cost.shape, dtype=bool)
+    goal_mask[goal] = True
+    return plan_path(cost, start, goal_mask, goal)
 
 class LidarNode(Node):
     def __init__(self):
@@ -108,24 +213,32 @@ class ObstacleCourseNode(Node):
 
         self.pose = None
 
-        self.static_map = None
-        self.max_range = None
+        self.course_map = None # created at the first scan with a pose
+        self.scan_count = 0 # number of scans added to the map
+        self.turning = False # True while turning in place. The map skips those scans
+        self.speed = 0.0 # last forward speed sent, for ramping up
+        self.state = EXPLORE
+        self.path = self.target = None # current path (world points) and where it leads
+        self.to_end = False # True once nothing is left to explore and the target is the end of the course
+        self.plan_time = -math.inf # when the path was last planned
 
     def sub_scan_callback(self, msg):
-        """Scan subscriber"""
-        self.last_scan = np.array(msg.ranges)
+        """Scan subscriber. Also adds the scan to the map"""
+        self.scan = msg
+        # This callback runs separately from timer_callback, so the pose check there doesn't cover it
+        if self.pose is None or self.turning:
+            return
+        if self.course_map is None:
+            self.course_map = CourseMap(self.pose[0], self.pose[1])
+            self.start = self.pose.copy() # only frontiers ahead of this pose count
 
-        if self.static_map is None:
-            self.static_map = StaticMap(self.pose[0], self.pose[1])
-            self.max_range = StaticMap.CELL_SIZE / msg.angle_increment
-
-        ranges = self.last_scan.copy()
+        ranges = np.array(msg.ranges)
         ranges[ranges < msg.range_min] = np.nan
         heading = np.deg2rad(self.pose[2])
-
         angles = heading + msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
-        self.static_map.update(self.pose[:2], angles, ranges, self.max_range)        
-        
+        self.scan_count += 1
+        self.course_map.update(self.pose[:2], angles, ranges, CourseMap.CELL_SIZE / msg.angle_increment, self.scan_count)
+
     def yaw_from_quaternion(self, q):
         '''Returns yaw angle (in rad) for orientation based on given quaternion input q'''
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
@@ -179,20 +292,204 @@ class ObstacleCourseNode(Node):
             return # Calibration mode: look, don't drive
 
         ###### INSERT CODE HERE ######
-        self.get_logger().info(f"Pose: {self.pose}")
-        self.move_2D(0.1)
+        if self.course_map is None:
+            return # no scan has been added to the map yet
+        if self.state == EXPLORE:
+            self.explore()
+        elif self.state == HOLD:
+            self.hold()
+        else:
+            self.cross()
         ###### INSERT CODE HERE ######
-                
-class StaticMap:
+
+    def explore(self):
+        '''Follow the path to the target, replanning every REPLAN_PERIOD. Hold when it leads past a moving obstacle'''
+        self.replan_if_due()
+        if self.path is None:
+            self.drive(0.0, 0.0) # nothing left to explore: stay, keep mapping and replanning
+            return
+        path = self.path_ahead()
+        if self.find_crossing(path) is None:
+            self.follow(path)
+            return
+        self.state = HOLD
+        self.was_blocked, self.clear_since, self.windows = False, None, []
+        self.get_logger().info(f"{self.state}: moving obstacle ahead")
+
+    def hold(self):
+        '''Approach a moving obstacle's sweep zone and face it. Meanwhile, time how long the crossing stays clear each
+        time the obstacle leaves it, and cross at the start of a window that should be long enough.
+        Everything is recomputed every tick, because the sweep zone grows while the robot watches'''
+        self.replan_if_due()
+        path = None if self.path is None else self.path_ahead()
+        crossing = None if path is None else self.find_crossing(path)
+        if crossing is None:
+            self.state = EXPLORE
+            self.get_logger().info(f"{self.state}: no moving obstacle ahead any more")
+            return
+        start, end = crossing
+        out = min(end + int(np.ceil(ARRIVE_TOL / CourseMap.CELL_SIZE)), len(path) - 1) # ARRIVE_TOL past the zone's reach
+        if start == 0: # already within reach, because the zone grew around the robot: leave by the shortest route
+            cost, blocked, reach = self.course_map.planning_grids()
+            outside = ~dilate(reach, disk(ARRIVE_TOL, CourseMap.CELL_SIZE)) & ~blocked # ARRIVE_TOL clear of reach
+            cells = plan_path(cost, self.course_map.to_cell(self.pose[:2]), outside)
+            if cells is not None:
+                self.cross_path = self.course_map.cells_to_world(np.array(cells))
+                self.state = CROSS
+                self.get_logger().info(f"{self.state}: within reach of a moving obstacle, leaving")
+            return
+
+        blocked = self.crossing_blocked(path[start:end])
+        window_started = self.was_blocked and not blocked
+        if blocked != self.was_blocked:
+            now = self.get_clock().now().nanoseconds * 1e-9
+            if blocked and self.clear_since is not None:
+                self.windows.append(now - self.clear_since) # a clear window just ended
+            if not blocked:
+                self.clear_since = now
+            self.was_blocked = blocked
+
+        if not self.follow(path[:start]):
+            return # still driving to the hold point, just outside the zone's reach
+        _, alpha = self.carrot(path)
+        if abs(alpha) > ALIGN_TOL:
+            self.turn_in_place(alpha)
+            return
+        self.drive(0.0, 0.0)
+
+        # The obstacle repeats its motion, so the window one cycle ago, two windows back, shows how long the one
+        # starting now will last. Near one end of the obstacle's path, windows alternate long and short
+        crossing_length = np.sum(np.linalg.norm(np.diff(path[start - 1:out + 1], axis=0), axis=1))
+        cross_time = crossing_length / MAX_SPEED + MAX_SPEED / (2 * MAX_ACCEL) # + time lost ramping up
+        if window_started and len(self.windows) >= 2 and self.windows[-2] >= cross_time:
+            self.cross_path = path[:out + 1]
+            self.state = CROSS
+            self.get_logger().info(f"{self.state}: expecting {self.windows[-2]:.1f} s clear, need {cross_time:.1f} s")
+
+    def cross(self):
+        '''Drive through the crossing, or out of reach, without stopping. Then go back to exploring'''
+        if self.follow(self.cross_path, safety=False, reverse=True):
+            self.state = EXPLORE
+            self.plan_time = -math.inf # replan at once
+            self.get_logger().info(f"{self.state}: crossed")
+
+    def replan_if_due(self):
+        '''Replan if REPLAN_PERIOD has passed since the last plan'''
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self.plan_time >= REPLAN_PERIOD:
+            self.plan_time = now
+            self.replan()
+
+    def path_ahead(self) -> np.ndarray:
+        '''The current path from the point closest to the robot'''
+        return self.path[np.argmin(np.linalg.norm(self.path - self.pose[:2], axis=1)):]
+
+    def replan(self):
+        '''Plan to the current target if it is still worth reaching, otherwise to the nearest frontier.
+        With no frontier left, head for the end of the course: the reachable cell farthest from the start.
+        Sets self.path (world points) and self.target, both None if nothing can be reached'''
+        cost, blocked, reach = self.course_map.planning_grids()
+        allowed = self.course_map.ahead(self.start) & ~blocked & ~reach # where a target may be
+        frontier = self.course_map.frontier(allowed)
+        start = self.course_map.to_cell(self.pose[:2])
+        cells = None
+        if self.target is not None:
+            goal = self.course_map.to_cell(self.target)
+            if frontier[goal] or (self.to_end and not frontier.any()):
+                cells = plan_to(cost, start, goal)
+        if cells is None:
+            cells = plan_path(cost, start, frontier) if frontier.any() else None
+            self.to_end = False
+        if cells is None:
+            _, _, g = search(cost, self.course_map.to_cell(self.start[:2]))
+            candidates = ((self.course_map.occupancy_map < CourseMap.FREE) & allowed).tolist()
+            end = max((cell for cell in g if candidates[cell[0]][cell[1]]), key=g.get, default=None)
+            cells = None if end is None else plan_to(cost, start, end)
+            self.to_end = True
+        self.path = None if cells is None else self.course_map.cells_to_world(np.array(cells))
+        self.target = None if cells is None else self.path[-1]
+        self.get_logger().debug(f"Planned in {self.get_clock().now().nanoseconds * 1e-9 - self.plan_time:.2f} s")
+
+    def find_crossing(self, path:np.ndarray):
+        '''(start, end) indices of the first stretch of path within SWEEP_CLEARANCE of the sweep zone, or None'''
+        near = self.course_map.distances(self.course_map.dynamic_map >= 0, path) < SWEEP_CLEARANCE
+        if not near.any():
+            return None
+        start = int(np.argmax(near))
+        clear = np.flatnonzero(~near[start:])
+        return start, (start + int(clear[0]) if len(clear) else len(path))
+
+    def crossing_blocked(self, crossing:np.ndarray) -> bool:
+        '''True if the latest scan saw a moving obstacle within SWEEP_CLEARANCE of the crossing (world points)'''
+        moving_now = self.course_map.dynamic_map == self.scan_count
+        return bool(np.any(self.course_map.distances(moving_now, crossing) < SWEEP_CLEARANCE))
+
+    def carrot(self, path:np.ndarray) -> tuple:
+        '''Remaining path length from the robot, and the angle (rad) from its heading to the carrot:
+        the first path point at least LOOKAHEAD away, after the point closest to the robot'''
+        distances = np.linalg.norm(path - self.pose[:2], axis=1)
+        i = int(np.argmin(distances))
+        remaining = distances[i] + np.sum(np.linalg.norm(np.diff(path[i:], axis=0), axis=1))
+        far = np.flatnonzero(distances[i:] >= LOOKAHEAD)
+        dx, dy = (path[i + far[0]] if len(far) else path[-1]) - self.pose[:2]
+        return remaining, math.radians(wrap_deg(math.degrees(math.atan2(dy, dx)) - self.pose[2]))
+
+    def follow(self, path:np.ndarray, safety:bool=True, reverse:bool=False) -> bool:
+        '''Drive along path with pure pursuit. Returns True once the robot has reached the end.
+        With reverse, back up instead of turning round when the carrot is behind the robot'''
+        remaining, alpha = self.carrot(path)
+        if remaining < ARRIVE_TOL:
+            self.drive(0.0, 0.0)
+            return True
+        if reverse and abs(alpha) > math.pi / 2:
+            backward = math.atan2(math.sin(alpha + math.pi), math.cos(alpha + math.pi)) # the carrot's angle from the rear
+            self.drive(-MAX_SPEED * math.cos(backward), 2 * MAX_SPEED * math.cos(backward) * math.sin(backward) / LOOKAHEAD)
+            return False
+        if abs(alpha) > TURN_IN_PLACE:
+            self.turn_in_place(alpha)
+            return False
+        if safety and self.blocked_ahead():
+            self.drive(0.0, 0.0) # wait for the map and the next plan to route around it
+            return False
+        speed = MAX_SPEED * math.cos(alpha)
+        turn = 2 * speed * math.sin(alpha) / LOOKAHEAD # turn rate along the arc through the carrot
+        if abs(turn) < MIN_TURN:
+            turn = 0.0 if abs(alpha) < ALIGN_TOL else math.copysign(MIN_TURN, alpha)
+        self.drive(speed, turn)
+        return False
+
+    def turn_in_place(self, alpha:float):
+        '''Turn on the spot towards a heading error of alpha (rad)'''
+        self.drive(0.0, math.copysign(np.clip(TURN_GAIN * abs(alpha), MIN_TURN, MAX_TURN), alpha))
+
+    def drive(self, speed:float, turn:float):
+        '''Send a forward speed (m/s) and turn rate (rad/s). Forward speed ramps up by at most MAX_ACCEL, but drops at once'''
+        self.speed = min(speed, max(self.speed, 0.0) + MAX_ACCEL * DT)
+        self.turning = speed == 0.0 and turn != 0.0
+        self.move_2D(self.speed, 0.0, turn)
+
+    def blocked_ahead(self) -> bool:
+        '''True if a LiDAR return is within STOP_DISTANCE in front of the robot's front edge'''
+        ranges = np.nan_to_num(np.array(self.scan.ranges), posinf=0.0) # no return -> 0, which never counts
+        angles = self.scan.angle_min + np.arange(len(ranges)) * self.scan.angle_increment
+        x, y = ranges * np.cos(angles), ranges * np.sin(angles)
+        ahead = (x > ROBOT_LENGTH / 2) & (x < ROBOT_LENGTH / 2 + STOP_DISTANCE) # beside the body, stopping can't help
+        return bool(np.any(ahead & (np.abs(y) < ROBOT_WIDTH / 2)))
+
+class CourseMap:
+    '''Two grids over the same cells, in the same frame as self.pose, that grow as the robot sees more.
+    occupancy_map holds walls and static obstacles as log-odds. dynamic_map holds, for each cell,
+    the number of the last scan that saw a moving obstacle there (-1 = never)'''
     CELL_SIZE = 0.025 # 2.5 cm square cell
     GROW_MARGIN = 1.0 # 1m of unknown space added when map grows
-    
+
     L_OCC = 0.85
     L_FREE = -0.4
     L_MIN, L_MAX = -4.0, 4.0
-    
+
     OCCUPIED = 1.0
     FREE = -1.0
+    CONFIDENT_FREE = -2.0 # a hit is a moving obstacle if its cell and all 8 neighbours are below this
 
     def __init__(self, start_x, start_y):
         """
@@ -208,20 +505,30 @@ class StaticMap:
             col 0  col 1  col 2  col 3
         """
         self.occupancy_map = np.zeros((1, 1))
+        self.dynamic_map = np.full((1, 1), -1)
         self.origin = np.array((start_x, start_y))
 
     def to_cells(self, xy: np.ndarray) -> np.ndarray:
         """
-        World coordinate to cell coordiate. 
+        World coordinate to cell coordiate.
         NOTE: since input is x, y this fn returns (col, row) that u need to flip when indexing
         """
         return np.floor((xy - self.origin) / self.CELL_SIZE).astype(int)
+
+    def to_cell(self, xy:np.ndarray) -> tuple:
+        '''One world point -> its cell as (row, col), ready for indexing'''
+        col, row = self.to_cells(xy[None, :])[0]
+        return int(row), int(col)
+
+    def cells_to_world(self, cells:np.ndarray) -> np.ndarray:
+        '''Cells (N, 2) as (row, col) -> world positions (N, 2) of their centres'''
+        return self.origin + (cells[:, ::-1] + 0.5) * self.CELL_SIZE
 
     def to_flat_cells(self, xy:np.ndarray) -> np.ndarray:
         """
         returns idx of cell if matrix is flattened
         """
-    
+
         cells = self.to_cells(xy)
 
         return np.unique(cells[:, 1] * self.occupancy_map.shape[1] + cells[:, 0])
@@ -230,23 +537,26 @@ class StaticMap:
         cells = self.to_cells(xy)
         rows, cols = self.occupancy_map.shape
 
-        below = np.maximum(-cells.min(axis = 0), 0) # cells needed before row 0, col 0
-        above = np.maximum(cells.max(axis=0) - (cols - 1, rows - 1), 0) # cells need after last row, last col
+        # Keep a border of one cell, so every hit has all 8 neighbours inside the map
+        below = np.maximum(1 - cells.min(axis = 0), 0) # cells needed before col 1, row 1
+        above = np.maximum(cells.max(axis=0) - (cols - 2, rows - 2), 0) # cells needed after the second-last col, row
 
         if not (below.any() or above.any()):
             # no need to grow map
-            return 
+            return
 
         margin = int(self.GROW_MARGIN / self.CELL_SIZE)
 
         before = np.where(below > 0, below + margin, 0)
         after = np.where(above > 0, above + margin, 0)
 
-        self.occupancy_map = np.pad(self.occupancy_map, ((before[1], after[1]), (before[0], after[0])))
+        pad = ((before[1], after[1]), (before[0], after[0]))
+        self.occupancy_map = np.pad(self.occupancy_map, pad)
+        self.dynamic_map = np.pad(self.dynamic_map, pad, constant_values=-1)
 
         self.origin = self.origin - before * self.CELL_SIZE
 
-    def update(self, lidar_xy: np.ndarray, angles: np.ndarray, ranges: np.ndarray, max_range: float):
+    def update(self, lidar_xy: np.ndarray, angles: np.ndarray, ranges: np.ndarray, max_range: float, scan_number: int):
         valid = np.isfinite(ranges)
         angles, ranges = angles[valid], ranges[valid]
 
@@ -265,10 +575,61 @@ class StaticMap:
         hits = self.to_flat_cells(ends[is_hit])
 
         grid = self.occupancy_map.reshape(-1)
+        # Beams can't pass through anything static, so a hit where beams keep passing is a moving obstacle.
+        # Checking the 8 neighbours too stops noisy hits just in front of a wall from counting
+        cols = self.occupancy_map.shape[1]
+        neighbourhood = (np.arange(-1, 2)[:, None] * cols + np.arange(-1, 2)).ravel()
+        dynamic = np.all(grid[hits[:, None] + neighbourhood] < self.CONFIDENT_FREE, axis=1)
+
         grid[free] += self.L_FREE
-        grid[hits] += self.L_OCC
+        grid[hits[~dynamic]] += self.L_OCC
 
         np.clip(grid, self.L_MIN, self.L_MAX, out = grid)
+        self.dynamic_map.reshape(-1)[hits[dynamic]] = scan_number
+
+    def planning_grids(self) -> tuple:
+        '''Returns (cost, blocked, reach), all the same shape as occupancy_map.
+        blocked: within half the robot's width of an occupied cell, so the robot's centre shouldn't go there.
+        reach: within SWEEP_CLEARANCE of the sweep zone, where a moving obstacle can touch the robot.
+        cost: cost of entering each cell. inf if occupied, INFLATED if blocked, otherwise higher the closer it is to a wall'''
+        occupied = self.occupancy_map > self.OCCUPIED
+        blocked = dilate(occupied, disk(ROBOT_WIDTH / 2, self.CELL_SIZE))
+
+        # Clearance: how many cells to the nearest blocked cell, counted up to the robot's width
+        clear_max = int(np.ceil(ROBOT_WIDTH / self.CELL_SIZE))
+        clearance = np.full(blocked.shape, clear_max)
+        near = blocked
+        for distance in range(clear_max):
+            clearance[near & (clearance == clear_max)] = distance
+            near = dilate(near, EIGHT_NEIGHBOURS)
+
+        cost = 1.0 + CLEARANCE_WEIGHT * (clear_max - clearance) / clear_max
+        cost[blocked] = INFLATED
+        cost[occupied] = np.inf
+        reach = dilate(self.dynamic_map >= 0, disk(SWEEP_CLEARANCE, self.CELL_SIZE))
+        return cost, blocked, reach
+
+    def ahead(self, pose:np.ndarray) -> np.ndarray:
+        '''True for cells ahead of the line through pose's position at right angles to its heading'''
+        rows, cols = self.occupancy_map.shape
+        x = self.origin[0] + (np.arange(cols) + 0.5) * self.CELL_SIZE
+        y = self.origin[1] + (np.arange(rows) + 0.5) * self.CELL_SIZE
+        heading = np.deg2rad(pose[2])
+        return (x[None, :] - pose[0]) * np.cos(heading) + (y[:, None] - pose[1]) * np.sin(heading) > 0
+
+    def frontier(self, allowed:np.ndarray) -> np.ndarray:
+        '''Free cells next to an unknown cell, inside allowed'''
+        log_odds = self.occupancy_map
+        unknown = (log_odds >= self.FREE) & (log_odds <= self.OCCUPIED)
+        return (log_odds < self.FREE) & dilate(unknown, EIGHT_NEIGHBOURS) & allowed
+
+    def distances(self, mask:np.ndarray, points:np.ndarray) -> np.ndarray:
+        '''Distance from each world point (N, 2) to the centre of the nearest True cell of mask. inf if there are none'''
+        if not mask.any():
+            return np.full(len(points), np.inf)
+        centres = self.cells_to_world(np.argwhere(mask))
+        return np.min(np.linalg.norm(points[:, None] - centres[None], axis=2), axis=1)
+
 
 def main(args=None):
     arg_parser = argparse.ArgumentParser(description="RB2301 final project")
