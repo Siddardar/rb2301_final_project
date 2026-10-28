@@ -73,7 +73,12 @@ SWEEP_CLEARANCE = math.hypot(ROBOT_WIDTH, ROBOT_LENGTH) / 2 + math.sqrt(2) * 0.0
 # angle 0 (rad). Gazebo's comes from the URDF (laser_joint): it faces backwards, so its angle 0 points behind the robot.
 # The real robot's has to be measured: run ./fp.sh --calibrate with a box in front of the robot (PLAN.md section 10)
 SIM_LIDAR_X, SIM_LIDAR_YAW = 0.114, math.pi
-REAL_LIDAR_X, REAL_LIDAR_YAW = 0.114, math.pi
+REAL_LIDAR_X, REAL_LIDAR_YAW = 0.040, math.pi
+# How far the middle of the robot's body is ahead of the pose (m). Paths are planned and followed for the body's middle.
+# Gazebo's pose is the rear axle: from the URDF meshes the body runs from 0.034 m behind it to 0.181 m ahead.
+# The real robot's Optitrack rigid body is taken to be at the body's middle, so its LiDAR is 0.114 - 0.074 m ahead of it
+SIM_BODY_OFFSET = 0.074
+REAL_BODY_OFFSET = 0.0
 SELF_MARGIN = 0.03 # m. A return within this of the robot's footprint is the robot itself (markers, cables), not the course
 
 # Driving
@@ -210,6 +215,7 @@ class ObstacleCourseNode(Node):
         else:
             self.max_translate_velocity = 0.3 # Please keep this in place; 0.3m/s is more than fast enough
         self.lidar_x, self.lidar_yaw = (SIM_LIDAR_X, SIM_LIDAR_YAW) if is_simulation else (REAL_LIDAR_X, REAL_LIDAR_YAW)
+        self.body_offset = SIM_BODY_OFFSET if is_simulation else REAL_BODY_OFFSET
 
         self.sub_scan = self.create_subscription(LaserScan, "scan", self.sub_scan_callback, 2) # Subscribe to LiDAR scan data
 
@@ -257,7 +263,7 @@ class ObstacleCourseNode(Node):
             return
         if self.course_map is None:
             self.course_map = CourseMap(self.pose[0], self.pose[1])
-            self.start = self.pose.copy() # only frontiers ahead of this pose count
+            self.start = np.array((*self.centre(), self.pose[2])) # only frontiers ahead of this count
 
         ranges, angles, _, _ = self.scan_points(msg)
         # Place each beam from the pose when it was taken. A real LiDAR takes a tenth of a second or more to sweep, so
@@ -271,13 +277,13 @@ class ObstacleCourseNode(Node):
         self.trail.append(self.pose.copy())
 
     def scan_points(self, msg) -> tuple:
-        '''A scan's ranges, each beam's angle from the robot's heading (rad), and the returns' (x, y) from the robot's
-        centre, x ahead and y to the left. Returns off the robot's own body, or under range_min, are nan'''
+        '''A scan's ranges, each beam's angle from the robot's heading (rad), and the returns' (x, y) from the middle of
+        the robot's body, x ahead and y to the left. Returns off the robot's own body, or under range_min, are nan'''
         ranges = np.array(msg.ranges, dtype=float)
         ranges[~(ranges >= msg.range_min)] = np.nan
         angles = self.lidar_yaw + msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
         with np.errstate(invalid="ignore"): # inf ranges
-            x, y = self.lidar_x + ranges * np.cos(angles), ranges * np.sin(angles)
+            x, y = self.lidar_x - self.body_offset + ranges * np.cos(angles), ranges * np.sin(angles)
         on_robot = (np.abs(x) < ROBOT_LENGTH / 2 + SELF_MARGIN) & (np.abs(y) < ROBOT_WIDTH / 2 + SELF_MARGIN)
         ranges[on_robot] = x[on_robot] = y[on_robot] = np.nan
         return ranges, angles, x, y
@@ -314,6 +320,11 @@ class ObstacleCourseNode(Node):
         self.pose = np.array((x,y,heading))
         self.pose_history.append((stamp_seconds(msg.header.stamp), *self.pose))
         return self.pose
+
+    def centre(self) -> np.ndarray:
+        '''(x, y) of the middle of the robot's body, body_offset ahead of the pose. Paths are planned and followed for it'''
+        heading = math.radians(self.pose[2])
+        return self.pose[:2] + self.body_offset * np.array((math.cos(heading), math.sin(heading)))
 
     def to_course(self, pose=None):
         '''Convert a pose [x, y, heading] (default: self.pose) from the CA2 maze frame to the final-project course frame. Optional; see [course] in optitrack_variables.config'''
@@ -435,7 +446,7 @@ class ObstacleCourseNode(Node):
             return
         # Face the far end of the crossing while waiting. It follows the sweep zone, so unlike the carrot it barely
         # moves when the path is replanned, and the robot doesn't keep turning (and skipping scans)
-        dx, dy = path[out] - self.pose[:2]
+        dx, dy = path[out] - self.centre()
         alpha = math.radians(wrap_deg(math.degrees(math.atan2(dy, dx)) - self.pose[2]))
         if abs(alpha) > ALIGN_TOL:
             self.turn_in_place(alpha)
@@ -458,7 +469,7 @@ class ObstacleCourseNode(Node):
 
     def path_ahead(self) -> np.ndarray:
         '''The current path from the point closest to the robot'''
-        return self.path[np.argmin(np.linalg.norm(self.path - self.pose[:2], axis=1)):]
+        return self.path[np.argmin(np.linalg.norm(self.path - self.centre(), axis=1)):]
 
     def replan(self):
         '''Plan to the current target if it is still worth reaching, otherwise to the nearest frontier farther along the
@@ -467,7 +478,7 @@ class ObstacleCourseNode(Node):
         cost, blocked, reach = self.course_map.planning_grids()
         allowed = self.course_map.ahead(self.start) & ~blocked & ~reach # where a target may be
         frontier = self.course_map.frontier(allowed)
-        start = self.course_map.to_cell(self.pose[:2])
+        start = self.course_map.to_cell(self.centre())
         cells = None
         if self.target is not None:
             goal = self.course_map.to_cell(self.target)
@@ -518,11 +529,11 @@ class ObstacleCourseNode(Node):
     def carrot(self, path:np.ndarray) -> tuple:
         '''Remaining path length from the robot, and the angle (rad) from its heading to the carrot:
         the first path point at least LOOKAHEAD away, after the point closest to the robot'''
-        distances = np.linalg.norm(path - self.pose[:2], axis=1)
+        distances = np.linalg.norm(path - self.centre(), axis=1)
         i = int(np.argmin(distances))
         remaining = distances[i] + np.sum(np.linalg.norm(np.diff(path[i:], axis=0), axis=1))
         far = np.flatnonzero(distances[i:] >= LOOKAHEAD)
-        dx, dy = (path[i + far[0]] if len(far) else path[-1]) - self.pose[:2]
+        dx, dy = (path[i + far[0]] if len(far) else path[-1]) - self.centre()
         return remaining, math.radians(wrap_deg(math.degrees(math.atan2(dy, dx)) - self.pose[2]))
 
     def follow(self, path:np.ndarray, safety:bool=True) -> bool:
