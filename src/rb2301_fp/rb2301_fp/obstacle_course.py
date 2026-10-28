@@ -3,6 +3,7 @@ import configparser
 import heapq
 import math
 import os
+from collections import deque
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -22,6 +23,10 @@ _PACKAGE_DIR = os.path.dirname(os.path.realpath(__file__))
 def wrap_deg(angle:float) -> float:
     '''Wrap an angle in degrees into [-180, 180).'''
     return (angle + 180.0) % 360.0 - 180.0
+
+def stamp_seconds(stamp) -> float:
+    '''A message header's stamp in seconds'''
+    return stamp.sec + stamp.nanosec * 1e-9
 
 def optitrack_to_maze(x:float, y:float, heading_deg:float, frame:dict) -> tuple:
     '''Optitrack-frame pose (x, y, heading in degrees) -> CA2 maze-frame pose (see optitrack_variables.config).'''
@@ -56,7 +61,13 @@ def load_frame(robot_number:int) -> tuple:
 # Robot size, from CA1
 ROBOT_WIDTH = 0.225 # m
 ROBOT_LENGTH = 0.289 # m
-SWEEP_CLEARANCE = math.hypot(ROBOT_WIDTH, ROBOT_LENGTH) / 2 # m. Any closer to a moving obstacle and the robot can touch it, whatever its heading
+# m. Any closer to a moving obstacle and the robot can touch it, whatever its heading: half the robot's diagonal, plus a
+# cell's diagonal, because the hits and the path are both cell centres, each up to half a cell's diagonal off
+SWEEP_CLEARANCE = math.hypot(ROBOT_WIDTH, ROBOT_LENGTH) / 2 + math.sqrt(2) * 0.025
+
+# LiDAR mounting, from the URDF (laser_joint). It faces backwards, so beam angle 0 points behind the robot
+LIDAR_X = 0.114 # m ahead of the robot's centre
+LIDAR_YAW = math.pi # rad, from the robot's heading to the LiDAR's angle 0
 
 # Driving
 DT = 0.05 # s, timer period
@@ -212,6 +223,7 @@ class ObstacleCourseNode(Node):
         self.timer = self.create_timer(0.05, self.timer_callback)  # Runs at 20Hz. Can be changed.
 
         self.pose = None
+        self.pose_history = deque(maxlen=100) # recent (stamp, x, y, heading), to find the pose when each scan was taken
 
         self.course_map = None # created at the first scan with a pose
         self.scan_count = 0 # number of scans added to the map
@@ -232,12 +244,26 @@ class ObstacleCourseNode(Node):
             self.course_map = CourseMap(self.pose[0], self.pose[1])
             self.start = self.pose.copy() # only frontiers ahead of this pose count
 
+        # The scan can wait in the queue while another callback runs, so the latest pose may be newer than the scan
+        pose = self.pose_at(stamp_seconds(msg.header.stamp))
         ranges = np.array(msg.ranges)
         ranges[ranges < msg.range_min] = np.nan
-        heading = np.deg2rad(self.pose[2])
-        angles = heading + msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
+        heading = np.deg2rad(pose[2])
+        angles = heading + LIDAR_YAW + msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
+        lidar_xy = pose[:2] + LIDAR_X * np.array((np.cos(heading), np.sin(heading)))
         self.scan_count += 1
-        self.course_map.update(self.pose[:2], angles, ranges, CourseMap.CELL_SIZE / msg.angle_increment, self.scan_count)
+        self.course_map.update(lidar_xy, angles, ranges, CourseMap.CELL_SIZE / msg.angle_increment, self.scan_count)
+
+    def pose_at(self, t:float) -> np.ndarray:
+        '''Pose [x, y, heading] at stamp t, interpolated between the recent poses. The latest pose if t isn't between them,
+        such as when the pose source stops publishing while the robot stands still, or its clock differs from the LiDAR's'''
+        history = np.array(self.pose_history)
+        if len(history) < 2 or not history[0, 0] <= t <= history[-1, 0]:
+            return self.pose
+        i = min(max(int(np.searchsorted(history[:, 0], t)), 1), len(history) - 1)
+        (t0, x0, y0, h0), (t1, x1, y1, h1) = history[i - 1], history[i]
+        f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+        return np.array((x0 + f * (x1 - x0), y0 + f * (y1 - y0), wrap_deg(h0 + f * wrap_deg(h1 - h0))))
 
     def yaw_from_quaternion(self, q):
         '''Returns yaw angle (in rad) for orientation based on given quaternion input q'''
@@ -253,6 +279,7 @@ class ObstacleCourseNode(Node):
         self.raw_pose = np.array((x,y,heading))
         x, y, heading = optitrack_to_maze(x, y, heading, self.frame) # CA2 maze frame, see optitrack_variables.config
         self.pose = np.array((x,y,heading))
+        self.pose_history.append((stamp_seconds(msg.header.stamp), *self.pose))
         return self.pose
 
     def to_course(self, pose=None):
@@ -266,6 +293,7 @@ class ObstacleCourseNode(Node):
         latest_pose_msg = msg.pose.pose 
         heading = np.rad2deg(self.yaw_from_quaternion(latest_pose_msg.orientation))
         self.pose = np.array((latest_pose_msg.position.x, latest_pose_msg.position.y, heading))
+        self.pose_history.append((stamp_seconds(msg.header.stamp), *self.pose))
         return self.pose
 
     def move_2D(self, x:float=0.0, y:float=0.0, turn:float=0.0):
@@ -337,6 +365,8 @@ class ObstacleCourseNode(Node):
                 self.cross_path = self.course_map.cells_to_world(np.array(cells))
                 self.state = CROSS
                 self.get_logger().info(f"{self.state}: within reach of a moving obstacle, leaving")
+            else:
+                self.drive(0.0, 0.0) # no way out: stay put rather than keep the last command
             return
 
         blocked = self.crossing_blocked(path[start:end])
@@ -351,7 +381,10 @@ class ObstacleCourseNode(Node):
 
         if not self.follow(path[:start]):
             return # still driving to the hold point, just outside the zone's reach
-        _, alpha = self.carrot(path)
+        # Face the far end of the crossing. It follows the sweep zone, so unlike the carrot it barely moves when the path
+        # is replanned, and the robot doesn't keep turning (and skipping scans) while it times the windows
+        dx, dy = path[out] - self.pose[:2]
+        alpha = math.radians(wrap_deg(math.degrees(math.atan2(dy, dx)) - self.pose[2]))
         if abs(alpha) > ALIGN_TOL:
             self.turn_in_place(alpha)
             return
@@ -420,8 +453,9 @@ class ObstacleCourseNode(Node):
         return start, (start + int(clear[0]) if len(clear) else len(path))
 
     def crossing_blocked(self, crossing:np.ndarray) -> bool:
-        '''True if the latest scan saw a moving obstacle within SWEEP_CLEARANCE of the crossing (world points)'''
-        moving_now = self.course_map.dynamic_map == self.scan_count
+        '''True if either of the last two scans saw a moving obstacle within SWEEP_CLEARANCE of the crossing (world points).
+        Two, so one scan that misses the obstacle doesn't open a window that isn't there'''
+        moving_now = self.course_map.dynamic_map >= self.scan_count - 1
         return bool(np.any(self.course_map.distances(moving_now, crossing) < SWEEP_CLEARANCE))
 
     def carrot(self, path:np.ndarray) -> tuple:
@@ -451,7 +485,9 @@ class ObstacleCourseNode(Node):
         if safety and self.blocked_ahead():
             self.drive(0.0, 0.0) # wait for the map and the next plan to route around it
             return False
-        speed = MAX_SPEED * math.cos(alpha)
+        # Ramp here rather than in drive(), so the turn rate matches the speed actually sent. Otherwise the robot spins
+        # at the full rate while it is still pulling away, which leaves the arc and maps scans mid-spin
+        speed = min(MAX_SPEED * math.cos(alpha), max(self.speed, 0.0) + MAX_ACCEL * DT)
         turn = 2 * speed * math.sin(alpha) / LOOKAHEAD # turn rate along the arc through the carrot
         if abs(turn) < MIN_TURN:
             turn = 0.0 if abs(alpha) < ALIGN_TOL else math.copysign(MIN_TURN, alpha)
@@ -471,8 +507,8 @@ class ObstacleCourseNode(Node):
     def blocked_ahead(self) -> bool:
         '''True if a LiDAR return is within STOP_DISTANCE in front of the robot's front edge'''
         ranges = np.nan_to_num(np.array(self.scan.ranges), posinf=0.0) # no return -> 0, which never counts
-        angles = self.scan.angle_min + np.arange(len(ranges)) * self.scan.angle_increment
-        x, y = ranges * np.cos(angles), ranges * np.sin(angles)
+        angles = LIDAR_YAW + self.scan.angle_min + np.arange(len(ranges)) * self.scan.angle_increment
+        x, y = LIDAR_X + ranges * np.cos(angles), ranges * np.sin(angles) # from the robot's centre
         ahead = (x > ROBOT_LENGTH / 2) & (x < ROBOT_LENGTH / 2 + STOP_DISTANCE) # beside the body, stopping can't help
         return bool(np.any(ahead & (np.abs(y) < ROBOT_WIDTH / 2)))
 
@@ -489,7 +525,8 @@ class CourseMap:
 
     OCCUPIED = 1.0
     FREE = -1.0
-    CONFIDENT_FREE = -2.0 # a hit is a moving obstacle if its cell and all 8 neighbours are below this
+    CONFIDENT_FREE = -2.0 # a hit is a moving obstacle if every cell within DYNAMIC_MARGIN of it is below this
+    DYNAMIC_MARGIN = 3 # cells. Covers pose error, so a wall hit that lands a little in front of the wall isn't dynamic
 
     def __init__(self, start_x, start_y):
         """
@@ -537,9 +574,10 @@ class CourseMap:
         cells = self.to_cells(xy)
         rows, cols = self.occupancy_map.shape
 
-        # Keep a border of one cell, so every hit has all 8 neighbours inside the map
-        below = np.maximum(1 - cells.min(axis = 0), 0) # cells needed before col 1, row 1
-        above = np.maximum(cells.max(axis=0) - (cols - 2, rows - 2), 0) # cells needed after the second-last col, row
+        # Keep a border of DYNAMIC_MARGIN cells, so every cell the dynamic test checks around a hit is inside the map
+        m = self.DYNAMIC_MARGIN
+        below = np.maximum(m - cells.min(axis = 0), 0) # cells needed before col m, row m
+        above = np.maximum(cells.max(axis=0) - (cols - 1 - m, rows - 1 - m), 0) # cells needed after col, row -1-m
 
         if not (below.any() or above.any()):
             # no need to grow map
@@ -576,9 +614,10 @@ class CourseMap:
 
         grid = self.occupancy_map.reshape(-1)
         # Beams can't pass through anything static, so a hit where beams keep passing is a moving obstacle.
-        # Checking the 8 neighbours too stops noisy hits just in front of a wall from counting
+        # Checking the cells around it too stops hits just in front of a wall, from noise or pose error, from counting
         cols = self.occupancy_map.shape[1]
-        neighbourhood = (np.arange(-1, 2)[:, None] * cols + np.arange(-1, 2)).ravel()
+        offsets = np.arange(-self.DYNAMIC_MARGIN, self.DYNAMIC_MARGIN + 1)
+        neighbourhood = (offsets[:, None] * cols + offsets).ravel()
         dynamic = np.all(grid[hits[:, None] + neighbourhood] < self.CONFIDENT_FREE, axis=1)
 
         grid[free] += self.L_FREE

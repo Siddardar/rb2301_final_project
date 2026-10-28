@@ -89,8 +89,9 @@ that side with `np.pad()`, adding the missing cells plus `GROW_MARGIN` (1 m) of
 unknown space, and moves `origin` to match.
 
 Padding copies the whole array, but the margin means it only happens a few
-times per run. The grid always keeps a border of one cell, so every cell a beam
-reaches has all 8 neighbors inside the grid (section 2.5).
+times per run. The grid always keeps a border of `DYNAMIC_MARGIN` cells, so
+every cell the dynamic test checks around a hit is inside the grid
+(section 2.5).
 
 ### 2.3 Two grids
 
@@ -146,26 +147,33 @@ Three thresholds turn the value into a class:
 | Free | l < −1 |
 | Unknown | Anything in between |
 
-Each beam starts at the robot's pose. Its angle is the robot's heading plus
-`angle_min + i * angle_increment`, so beam 0 is assumed to point forward.
-Section 10, step 2, checks this on the real robot.
+Each beam starts at the LiDAR, `LIDAR_X` (0.114 m) ahead of the robot's
+center. The LiDAR is mounted facing backward (`laser_joint` in the URDF has a
+yaw of π), so a beam's angle is the robot's heading plus `LIDAR_YAW` (π) plus
+`angle_min + i * angle_increment`. With `angle_min` = −π, beam 0 points forward,
+as in CA1. Section 10, step 2, checks this on the real robot.
 
 ### 2.5 Static or dynamic
 
 Before a scan updates the map, the robot checks the cell each hit lands in. The
 test is that **a beam can't pass through anything static**:
 
-- If the hit's cell and all 8 of its neighbors are **confidently free**
-  (l < `CONFIDENT_FREE`, −2), many beams have passed through that spot, so
+- If every cell within `DYNAMIC_MARGIN` (3 cells, 7.5 cm) of the hit is
+  **confidently free** (l < `CONFIDENT_FREE`, −2), many beams have passed
+  through that spot, so
   nothing static can be there. The hit is **dynamic**. Its scan number goes into
   `dynamic_map`, and it doesn't add `L_OCC` to the occupancy map.
 - Otherwise, the hit is **static** and adds `L_OCC` to its cell as usual.
 
 The beam's pass-through cells update the occupancy map in both cases.
 
-**Why the neighbors.** LiDAR noise can put a wall hit one cell in front of the
-wall. That cell may be confidently free, but its neighbor, the wall, isn't, so
-the hit doesn't count as dynamic.
+**Why the margin.** Noise or a small pose error can put a wall hit a few cm in
+front of the wall. That cell may be confidently free, but the wall within the
+margin isn't, so the hit doesn't count as dynamic. In replays of simulation runs
+with the pose deliberately 40 ms off, a margin of one cell marked up to 190 wall
+cells as dynamic, two cells up to 28, and three cells at most 7. The moving
+obstacles were detected the same with all three, since they move through open
+floor.
 
 **Why −2.** It's stricter than the free threshold of −1. A cell needs about 6
 beams through it, with no hits, to reach −2. At about 10 scans a second, that's
@@ -213,13 +221,24 @@ the beam, so it isn't safe to treat as open space.
 Ignoring far points loses nothing, because the robot sees those walls again as
 it gets closer.
 
-### 2.8 No updates while turning in place
+### 2.8 The pose when the scan was taken
 
-The scan and the Optitrack pose arrive at slightly different times. While the
-robot turns in place, that small delay becomes a large heading error, which
-smears walls across the map. `drive()` sets `self.turning` whenever the robot
-turns with no forward speed, and `sub_scan_callback()` skips scans while it's
-set. Mapping resumes as soon as the robot drives forward or stops.
+The scan and the pose arrive at different times, and a scan can also wait in
+the queue while another callback, such as a plan, runs. While the robot turns,
+pairing a scan with the latest pose gives a heading error of the turn rate times
+that delay. In the simulation, one scan paired with a pose 0.1 s newer, taken
+while the robot turned at 0.6 rad/s, put a row of hits 5 cm in front of a wall.
+Those hits counted as dynamic, and the robot held there for good.
+
+So the pose callbacks keep the last 100 poses with their stamps, and
+`pose_at()` interpolates the pose at the scan's own stamp. If the stamp isn't
+between the stored poses, it uses the latest pose. That happens when the pose
+source stops publishing while the robot stands still (Gazebo's odometry does),
+or when the two clocks disagree.
+
+As a second guard, `drive()` sets `self.turning` whenever the robot turns with
+no forward speed, and `sub_scan_callback()` skips scans while it's set. Mapping
+resumes as soon as the robot drives forward or stops.
 
 ## 3. Moving obstacles
 
@@ -232,7 +251,7 @@ When the robot first sees a moving obstacle, the cells it occupies aren't
 confidently free yet, so its hits count as static and the occupancy map marks
 those cells as occupied. The planner avoids them, which is the safe mistake. As
 the obstacle moves away, beams pass through those cells and lower their values.
-Once a cell and its neighbors drop below −2, the obstacle's hits there count as
+Once a cell and the cells around it drop below −2, the obstacle's hits there count as
 dynamic and stop adding `L_OCC`. After a cycle or two of the obstacle's motion,
 the occupancy map shows free floor where the obstacle moves, and the dynamic map
 shows the sweep zone.
@@ -397,8 +416,11 @@ This is the one rule that only applies to moving obstacles.
 
 ### 6.1 The crossing
 
-`SWEEP_CLEARANCE` is half the robot's diagonal, about 0.18 m. Any closer to a
-moving obstacle and the robot can touch it, whatever its heading. Two areas
+`SWEEP_CLEARANCE` is half the robot's diagonal plus one cell's diagonal, about
+0.22 m. Any closer to a moving obstacle and the robot can touch it, whatever its
+heading. The extra cell is there because the sweep zone and the path are both
+cell centers, and each can be up to half a cell's diagonal from the real
+point. Two areas
 follow from it:
 
 - **Reach:** every cell within `SWEEP_CLEARANCE` of the sweep zone. Targets are
@@ -416,13 +438,19 @@ point chosen once could end up inside it.
 
 On each tick in `HOLD`, the robot does the following:
 
-1. **Times the windows.** If the latest scan saw a moving obstacle within
-   `SWEEP_CLEARANCE` of the crossing, the crossing is blocked. The robot records
+1. **Times the windows.** If either of the last two scans saw a moving obstacle
+   within `SWEEP_CLEARANCE` of the crossing, the crossing is blocked. Two scans,
+   so a single scan that misses the obstacle doesn't open a short window that
+   isn't there. In the simulation, one such 0.08 s window swapped the long and
+   short windows, and the robot crossed into the obstacle. The robot records
    how long the crossing stays clear each time, from the moment it turns clear
    until it's blocked again. Each of these is a **window**.
 2. **Drives to the hold point,** the last path point before the crossing.
-3. **Faces along the path,** turning in place until it's within `ALIGN_TOL`
-   (3°), then stops.
+3. **Faces the far end of the crossing,** turning in place until it's within
+   `ALIGN_TOL` (3°), then stops. The far end follows the sweep zone, so it
+   barely moves when the path is replanned. Facing the carrot instead kept the
+   robot turning, and scans taken while turning in place aren't mapped, so the
+   window timing went stale.
 4. **Decides whether to cross.** It crosses only at the start of a window, and
    only if the window before last was long enough:
 
@@ -460,7 +488,7 @@ zone grew around it, it leaves by the shortest route. It plans to the nearest
 cell that is at least `ARRIVE_TOL` clear of the reach area and not blocked, then
 follows that path in `CROSS`. In this one case, the robot can drive backward
 (section 7), because turning around would keep it within reach for longer. If
-there's no route out, it stays in `HOLD`.
+there's no route out, it stops and stays in `HOLD`.
 
 ## 7. Driving
 
@@ -494,7 +522,9 @@ rear instead of turning around.
 
 **Speed.** The robot drives at up to `MAX_SPEED` (0.3 m/s). Forward speed rises
 by at most `MAX_ACCEL` (0.5 m/s²) so the robot doesn't jerk, but drops at once,
-so it can always stop in time.
+so it can always stop in time. `follow()` ramps the speed before working out the
+turn rate, so the turn matches the speed actually sent. Otherwise the robot
+would spin at the full rate while pulling away from a stop.
 
 **Arriving.** The robot has reached the end of a path when the path left from
 its closest point is shorter than `ARRIVE_TOL` (5 cm).
@@ -530,11 +560,13 @@ Every constant describes the robot or its sensors. None describes the course.
 | `CELL_SIZE` | 0.025 m | Decided before testing (section 2.1). |
 | `GROW_MARGIN` | 1 m | Section 2.2. |
 | `ROBOT_WIDTH`, `ROBOT_LENGTH` | 0.225 m, 0.289 m | CA1. |
-| `SWEEP_CLEARANCE` | Computed | Half the robot's diagonal (section 6.1). |
+| `LIDAR_X`, `LIDAR_YAW` | 0.114 m, π | URDF `laser_joint` (section 2.4). |
+| `SWEEP_CLEARANCE` | Computed | Half the robot's diagonal plus a cell's diagonal (section 6.1). |
 | `L_OCC`, `L_FREE` | +0.85, −0.4 | Standard log-odds values (section 2.4). |
 | `L_MIN`, `L_MAX` | −4, +4 | Section 2.4. |
 | `OCCUPIED`, `FREE` | +1, −1 | Section 2.4. |
 | `CONFIDENT_FREE` | −2 | Section 2.5. |
+| `DYNAMIC_MARGIN` | 3 cells | Pose error (section 2.5). |
 | `max_range` | Computed | `CELL_SIZE / angle_increment` (section 2.7). |
 | `INFLATED` | 1000 | Section 5.2. |
 | `CLEARANCE_WEIGHT` | 4 | Tuning (section 5.3). |
@@ -597,10 +629,11 @@ Test each step before starting the next one:
 
 1. **Calibrate.** Run with `--calibrate` and check that the pose matches where
    the robot is.
-2. **Check the LiDAR direction.** The code assumes beam 0 points forward. Place
-   an object in front of the robot and confirm that the map shows it there. If
-   the map comes out rotated by 180°, add `np.pi` to `angles` in
-   `sub_scan_callback()`. Your CA1 code used a mounting yaw of π.
+2. **Check the LiDAR direction.** The code uses the simulation's mounting,
+   `LIDAR_YAW` = π and `LIDAR_X` = 0.114 m. Place an object in front of the
+   robot and confirm that the map shows it there. If the map comes out rotated
+   by 180°, set `LIDAR_YAW` to 0. Both `sub_scan_callback()` and
+   `blocked_ahead()` use it.
 3. **Mapping.** Push the robot through the course by hand and log the map. Walls
    should be thin and continuous, and only the moving obstacles should appear in
    the dynamic map.
@@ -618,6 +651,10 @@ The robot runs ROS Foxy, so Python 3.8. `np.nan_to_num(posinf=...)` needs numpy
 These limits are accepted to keep the code simple:
 
 - If no window is ever long enough, the robot waits at the hold point.
+- The sweep zone is learned as the obstacle moves. If the robot reaches a track
+  before it has seen the obstacle cover the part next to its path, it can stop
+  closer than `SWEEP_CLEARANCE` and has to escape once the zone grows. In
+  Gazebo this happened right after the gate.
 - If a static cell is wrongly marked dynamic near the path, the robot waits for
   a window that never comes.
 - A cell that a moving obstacle occupies more than about 30% of the time can
