@@ -587,6 +587,7 @@ class CourseMap:
     FREE = -1.0
     CONFIDENT_FREE = -2.0 # a hit is a moving obstacle if every cell within DYNAMIC_MARGIN of it is below this
     DYNAMIC_MARGIN = 3 # cells. Covers pose error, so a wall hit that lands a little in front of the wall isn't dynamic
+    CONFIRM_DISTANCE = 0.2 # m. A moving obstacle moves less than this between scans (2 m/s at 10 scans a second)
 
     def __init__(self, start_x, start_y):
         """
@@ -603,6 +604,7 @@ class CourseMap:
         """
         self.occupancy_map = np.zeros((1, 1))
         self.dynamic_map = np.full((1, 1), -1)
+        self.last_dynamic = np.zeros((0, 2)) # the previous scan's dynamic hits (world), to confirm the next scan's
         self.origin = np.array((start_x, start_y))
 
     def to_cells(self, xy: np.ndarray) -> np.ndarray:
@@ -688,7 +690,18 @@ class CourseMap:
         grid[hits[~dynamic]] += self.L_OCC
 
         np.clip(grid, self.L_MIN, self.L_MAX, out = grid)
-        self.dynamic_map.reshape(-1)[hits[dynamic]] = scan_number
+
+        # A moving obstacle shows up scan after scan, a little further along each time. One bad scan, such as one taken
+        # while the robot spins and placed a few degrees off, puts stray wall hits in cleared floor once only. So a
+        # dynamic hit only goes into the dynamic map if the previous scan also had one within CONFIRM_DISTANCE
+        points = self.cells_to_world(np.stack(np.divmod(hits[dynamic], cols), axis=1))
+        if len(points) and len(self.last_dynamic):
+            gaps = np.linalg.norm(points[:, None] - self.last_dynamic[None], axis=2)
+            confirmed = np.min(gaps, axis=1) < self.CONFIRM_DISTANCE
+        else:
+            confirmed = np.zeros(len(points), dtype=bool)
+        self.last_dynamic = points
+        self.dynamic_map.reshape(-1)[hits[dynamic][confirmed]] = scan_number
 
     def planning_grids(self) -> tuple:
         '''Returns (cost, blocked, reach), all the same shape as occupancy_map.
