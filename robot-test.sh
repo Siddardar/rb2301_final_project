@@ -9,6 +9,8 @@ Usage: ./robot-test.sh NN [options]
   NN                  Two-digit robot number (01-54; 07 -> 192.168.1.207)
   --group GROUP       Workspace suffix (default: 11)
   --calibrate         Print poses without driving
+  --map               Show the robot's map live on this computer (needs numpy and
+                      matplotlib; see tools/view_map.py)
   --setup-only        Sync and build, then exit without launching anything
   --no-build          Sync only; reuse the existing build
   --terminal BACKEND  auto, gnome, or tmux (default: auto)
@@ -18,6 +20,7 @@ Examples:
   ./robot-test.sh 07
   ./robot-test.sh 07 --group 11
   ./robot-test.sh 07 --calibrate --terminal tmux
+  ./robot-test.sh 07 --calibrate --map
 
 Uses SSH keys when sshpass is absent; otherwise uses ROBOT_PASSWORD (default:
 bingda). Install sshpass for automatic password login. Linux with a desktop uses
@@ -25,6 +28,10 @@ gnome-terminal; macOS or headless Linux uses tmux. Source is located relative to
 this script, so it can be run from any directory.
 
 Controls: ENTER = start, s = pause, r = resume, q / Ctrl+C = stop everything.
+
+The node saves a map snapshot once a second on the robot, in the session's log
+directory. With --map, they're also copied to maps/<session> here. The viewer
+stays open after the session ends, so you can step back through the run.
 HELP
 }
 
@@ -41,6 +48,7 @@ shift
 group=11
 calibrate=0
 setup_only=0
+map=0
 build=1
 terminal=auto
 while (( $# )); do
@@ -53,6 +61,7 @@ while (( $# )); do
             esac
             shift 2 ;;
         --calibrate) calibrate=1; shift ;;
+        --map) map=1; shift ;;
         --setup-only) setup_only=1; shift ;;
         --no-build) build=0; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -68,6 +77,12 @@ local_run="$script_dir/fp.sh"
 [[ -f $local_src/rb2301_fp/obstacle_course.py ]] || die "Missing $local_src/rb2301_fp/obstacle_course.py"
 [[ -x $local_run ]] || die "Missing or not executable: $local_run"
 for tool in ssh rsync; do command -v "$tool" >/dev/null || die "Install $tool first."; done
+if (( map && ! setup_only )); then
+    python=python3
+    [[ ! -x $script_dir/.venv/bin/python3 ]] || python=$script_dir/.venv/bin/python3
+    "$python" -c 'import numpy, matplotlib' 2>/dev/null ||
+        die "--map needs numpy and matplotlib. Install them with: python3 -m venv '$script_dir/.venv' && '$script_dir/.venv/bin/pip' install numpy matplotlib"
+fi
 if (( ! setup_only )); then
     if [[ $terminal == auto ]]; then
         if [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] && command -v gnome-terminal >/dev/null; then
@@ -306,7 +321,7 @@ PY
             sleep 0.1
         done
         [[ ! -f $state/quit ]] || exit 0
-        args=(./fp.sh)
+        args=(./fp.sh --snapshots "$state/maps")
         (( ! calibrate )) || args+=(--calibrate) ;;
     *) echo "Unknown service: $role" >&2; exit 1 ;;
 esac
@@ -367,6 +382,15 @@ fi
 if (( setup_only )); then echo 'Setup complete.'; exit 0; fi
 remote_runner prepare
 echo "Logs on robot: $state"
+if (( map )); then
+    local_maps="$script_dir/maps/$session"
+    mkdir -p "$local_maps"
+    # BatchMode: once the session ends and the shared connection closes, copying fails instead of asking for a password
+    viewer_rsh=$(quote_command ssh "${ssh_options[@]}" -o BatchMode=yes)
+    "$python" "$script_dir/tools/view_map.py" "$local_maps" --remote "$target:$state/maps" --rsh "$viewer_rsh" \
+        > "$local_maps/viewer.log" 2>&1 &
+    echo "Map viewer started. Snapshots are copied to $local_maps"
+fi
 
 pane_command() {
     local role=$1 command

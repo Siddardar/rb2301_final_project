@@ -621,6 +621,18 @@ the Python standard library only:
 - `CourseMap`: both grids, growing, the log-odds update, and the grids the
   planner needs (`planning_grids()`, `ahead()`, `frontier()`, `distances()`).
 
+Two more files help you see what the robot is doing:
+
+- `tools/view_map.py` draws the map on your laptop, with the sweep zone, the
+  path, the target, the robot, and its trail. It needs numpy and matplotlib, but
+  not ROS. It reads the files `obstacle_course.py` saves:
+  - With `--snapshots DIR`, the node saves the map to `DIR` once a second
+    (`save_snapshot()`). This works with `--calibrate` too.
+  - On exit, the node saves the map to `fp_map.npz` (`save_map()`).
+- `robot-test.sh` syncs, builds, and runs everything on the robot from your
+  laptop. It always saves snapshots on the robot. With `--map`, it also copies
+  them to `maps/<session>` on your laptop and shows them live.
+
 ## 10. Testing
 
 ### Done so far
@@ -650,9 +662,9 @@ Test each step before starting the next one:
    robot and confirm that the map shows it there. If the map comes out rotated
    by 180°, set `LIDAR_YAW` to 0. Both `sub_scan_callback()` and
    `blocked_ahead()` use it.
-3. **Mapping.** Push the robot through the course by hand and log the map. Walls
-   should be thin and continuous, and only the moving obstacles should appear in
-   the dynamic map.
+3. **Mapping.** Run `./robot-test.sh NN --calibrate --map` and push the robot
+   through the course by hand while you watch the map. Walls should be thin and
+   continuous, and only the moving obstacles should appear in the dynamic map.
 4. **Driving.** Check that the robot follows a path, turns in place, and stops
    for an object in front of it.
 5. **Full run without moving obstacles.** Explore the zig-zag and the door.

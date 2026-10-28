@@ -200,12 +200,15 @@ class LidarNode(Node):
 
 class ObstacleCourseNode(Node):
     '''Node to navigate obstacle course, using pose from either gazebo odometer or optitrack and lidar scan data'''
-    def __init__(self, is_simulation:bool=True, calibrate:bool=False):
+    def __init__(self, is_simulation:bool=True, calibrate:bool=False, snapshots:str=None):
         super().__init__('obstaclecourse')
         self.get_logger().info("Starting ObstacleCourseNode")
 
         self.is_simulation = is_simulation
         self.calibrate = calibrate # Real robot: only print poses, never drive
+        self.snapshots = snapshots # directory to save map snapshots in, for tools/view_map.py. None = don't save
+        if snapshots:
+            os.makedirs(snapshots, exist_ok=True)
         self.raw_pose = None # Pose exactly as Optitrack reported it (real robot only)
         self.frame = self.course = None
         self._ticks = 0
@@ -254,6 +257,7 @@ class ObstacleCourseNode(Node):
         self.to_end = False # True once nothing is left to explore and the target is the end of the course
         self.progress = -math.inf # farthest the robot has been from the start, as path cost. New targets are beyond it
         self.plan_time = -math.inf # when the path was last planned
+        self.snapshot_time = -math.inf # when the last map snapshot was saved
 
     def sub_scan_callback(self, msg):
         """Scan subscriber. Also adds the scan to the map"""
@@ -275,6 +279,30 @@ class ObstacleCourseNode(Node):
         self.scan_count += 1
         self.course_map.update(lidar_xy, heading + angles, ranges, CourseMap.CELL_SIZE / msg.angle_increment, self.scan_count)
         self.trail.append(self.pose.copy())
+        if self.snapshots:
+            self.save_snapshot()
+
+    def save_snapshot(self):
+        '''Save the map once a second, for tools/view_map.py. Runs here rather than in timer_callback so it also works
+        with --calibrate, where you push the robot by hand to check the map'''
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self.snapshot_time < 1.0:
+            return
+        self.snapshot_time = now
+        path = os.path.join(self.snapshots, f"map_{self.scan_count:06d}.npz")
+        with open(path + ".tmp", "wb") as f: # write, then rename, so the viewer never copies half a file
+            np.savez_compressed(f, **self.map_data())
+        os.replace(path + ".tmp", path)
+
+    def map_data(self) -> dict:
+        '''The map and what the robot is doing with it, as arrays to save. pose is the middle of the robot's body, like
+        start and the path, so the viewer draws the body where it is'''
+        m = self.course_map
+        return dict(occupancy=m.occupancy_map.astype(np.float16), dynamic=m.dynamic_map.astype(np.int32), origin=m.origin,
+                    cell_size=m.CELL_SIZE, trail=np.array(self.trail), scan_count=self.scan_count,
+                    pose=np.array((*self.centre(), self.pose[2])),
+                    start=self.start, state=self.state, path=np.empty((0, 2)) if self.path is None else self.path,
+                    target=np.full(2, np.nan) if self.target is None else self.target)
 
     def scan_points(self, msg) -> tuple:
         '''A scan's ranges, each beam's angle from the robot's heading (rad), and the returns' (x, y) from the middle of
@@ -757,6 +785,7 @@ class CourseMap:
 def main(args=None):
     arg_parser = argparse.ArgumentParser(description="RB2301 final project")
     arg_parser.add_argument('--calibrate', action='store_true', help="Real robot: only print the Optitrack pose and the maze-frame pose twice a second, never drive")
+    arg_parser.add_argument('--snapshots', metavar='DIR', help="Save a map snapshot to DIR once a second, for tools/view_map.py")
     cli_args, ros_args = arg_parser.parse_known_args(args=args)
     print("Starting obstacle course")
     rclpy.init(args=ros_args)
@@ -769,7 +798,7 @@ def main(args=None):
     lidar.destroy_node()
 
     # Start spinning the obstacle node and only stop once SystemExit error is raised within the node callback
-    obstacle = ObstacleCourseNode(is_simulation, cli_args.calibrate)
+    obstacle = ObstacleCourseNode(is_simulation, cli_args.calibrate, cli_args.snapshots)
     try:
         rclpy.spin(obstacle)
     except (SystemExit, KeyboardInterrupt):
@@ -784,12 +813,10 @@ def main(args=None):
         rclpy.shutdown()
 
 def save_map(node:ObstacleCourseNode, path:str="fp_map.npz"):
-    '''Save what the robot mapped, to check a run on a laptop (PLAN.md section 10)'''
+    '''Save what the robot mapped, to check a run on a laptop with tools/view_map.py (PLAN.md section 10)'''
     if node.course_map is None:
         return
-    m = node.course_map
-    np.savez(path, occupancy=m.occupancy_map, dynamic=m.dynamic_map, origin=m.origin, cell_size=m.CELL_SIZE,
-             trail=np.array(node.trail))
+    np.savez_compressed(path, **node.map_data())
     print(f"Saved the map to {os.path.abspath(path)}")
 
 if __name__ == '__main__':
