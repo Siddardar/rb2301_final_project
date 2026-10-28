@@ -440,12 +440,12 @@ class ObstacleCourseNode(Node):
             self.follow(path)
             return
         self.state = HOLD
-        self.seen_blocked = False
+        self.was_blocked, self.exits = False, 0
         self.get_logger().info(f"{self.state}: moving obstacle ahead")
 
     def hold(self):
-        '''Wait for a moving obstacle to pass, standing still while it's in the crossing, then cross. While the crossing
-        is clear and the obstacle hasn't passed yet, approach the sweep zone and face it.
+        '''Wait for a moving obstacle to leave the crossing twice, standing still while it's in the crossing, then cross.
+        While the crossing is clear, approach the sweep zone and face it.
         Everything is recomputed every tick, because the sweep zone grows while the robot watches'''
         self.replan_if_due()
         path = None if self.path is None else self.path_ahead()
@@ -457,16 +457,19 @@ class ObstacleCourseNode(Node):
         start, end = crossing
         out = min(end + int(np.ceil(ARRIVE_TOL / CourseMap.CELL_SIZE)), len(path) - 1) # ARRIVE_TOL past the zone's reach
         blocked = self.crossing_blocked(path[start:end])
-        self.seen_blocked |= blocked
+        if self.was_blocked and not blocked:
+            self.exits += 1 # the obstacle has just left the crossing
+        self.was_blocked = blocked
         if blocked:
             self.drive(0.0, 0.0) # stay still, wherever the robot is, until the obstacle has passed
             return
-        # Cross once the obstacle has passed: seen in the crossing during this hold, and now out of it. Having just
-        # left, it is moving away. A crossing that has been clear since the robot arrived may have it on its way back
-        if self.seen_blocked:
+        # Cross as the obstacle leaves for the second time. By then it has left, come back and left again, so the robot
+        # has waited at least one whole period. Having just left, it is moving away. Crossing at the first exit, the
+        # robot can't tell whether the obstacle is about to come back
+        if self.exits >= 2:
             self.cross_path = path[:out + 1]
             self.state = CROSS
-            self.get_logger().info(f"{self.state}: moving obstacle has passed")
+            self.get_logger().info(f"{self.state}: moving obstacle has left the crossing twice")
             return
         # Until then, approach the hold point while the crossing is clear. If the sweep zone has grown around the
         # robot (start == 0), it's already as close as it gets: it stays where it is rather than looking for a way out
@@ -737,15 +740,19 @@ class CourseMap:
         '''Returns (cost, blocked, reach), all the same shape as occupancy_map.
         blocked: within half the robot's width of an occupied cell, so the robot's centre shouldn't go there.
         reach: within SWEEP_CLEARANCE of the sweep zone, where a moving obstacle can touch the robot.
-        cost: cost of entering each cell. inf if occupied, INFLATED if blocked, otherwise higher the closer it is to a wall,
-        and up to MARGIN_COST more within WALL_MARGIN of blocked'''
+        cost: cost of entering each cell. inf if occupied, INFLATED if blocked, otherwise higher the closer it is to a wall
+        or the sweep zone, and up to MARGIN_COST more within WALL_MARGIN of them'''
         occupied = self.occupancy_map > self.OCCUPIED
         blocked = dilate(occupied, disk(ROBOT_WIDTH / 2, self.CELL_SIZE))
+        sweep = self.dynamic_map >= 0
 
-        # Clearance: how many cells to the nearest blocked cell, counted up to the robot's width
+        # Clearance: how many cells to the nearest blocked cell, counted up to the robot's width. The sweep zone, inflated
+        # the same way, counts too. Hits marked as moving never become walls, so a static thing wrongly marked as moving,
+        # such as a door post, would otherwise get no margin. The sweep zone costs a lot but isn't blocked, so a path still
+        # crosses it, the shortest way
         clear_max = int(np.ceil(ROBOT_WIDTH / self.CELL_SIZE))
         clearance = np.full(blocked.shape, clear_max)
-        near = blocked
+        near = blocked | dilate(sweep, disk(ROBOT_WIDTH / 2, self.CELL_SIZE))
         for distance in range(clear_max):
             clearance[near & (clearance == clear_max)] = distance
             near = dilate(near, EIGHT_NEIGHBOURS)
@@ -757,7 +764,7 @@ class CourseMap:
         cost += MARGIN_COST * np.clip((margin_cells + 1 - clearance) / margin_cells, 0.0, 1.0)
         cost[blocked] = INFLATED
         cost[occupied] = np.inf
-        reach = dilate(self.dynamic_map >= 0, disk(SWEEP_CLEARANCE, self.CELL_SIZE))
+        reach = dilate(sweep, disk(SWEEP_CLEARANCE, self.CELL_SIZE))
         return cost, blocked, reach
 
     def ahead(self, pose:np.ndarray) -> np.ndarray:
