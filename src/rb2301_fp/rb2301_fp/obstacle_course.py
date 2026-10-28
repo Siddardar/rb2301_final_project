@@ -61,9 +61,13 @@ def load_frame(robot_number:int) -> tuple:
 # Robot size, from CA1
 ROBOT_WIDTH = 0.225 # m
 ROBOT_LENGTH = 0.289 # m
+# m. Extra distance for pose, LiDAR and steering errors on the real robot. WALL_MARGIN is kept from walls and static
+# obstacles wherever there's room (section 5.3 of PLAN.md). SAFETY_MARGIN is always kept from moving obstacles
+WALL_MARGIN = 0.15
+SAFETY_MARGIN = 0.05
 # m. Any closer to a moving obstacle and the robot can touch it, whatever its heading: half the robot's diagonal, plus a
 # cell's diagonal, because the hits and the path are both cell centres, each up to half a cell's diagonal off
-SWEEP_CLEARANCE = math.hypot(ROBOT_WIDTH, ROBOT_LENGTH) / 2 + math.sqrt(2) * 0.025
+SWEEP_CLEARANCE = math.hypot(ROBOT_WIDTH, ROBOT_LENGTH) / 2 + math.sqrt(2) * 0.025 + SAFETY_MARGIN
 
 # LiDAR mounting: how far ahead of the robot's centre it is (m), and the angle from the robot's heading to the LiDAR's
 # angle 0 (rad). Gazebo's comes from the URDF (laser_joint): it faces backwards, so its angle 0 points behind the robot.
@@ -89,6 +93,7 @@ REPLAN_PERIOD = 1.0 # s
 # Planning
 INFLATED = 1000.0 # cost of a cell within half the robot's width of an occupied cell
 CLEARANCE_WEIGHT = 4.0 # extra cost of a cell right next to an inflated one. Keeps paths in the middle of gaps
+MARGIN_COST = 20.0 # extra cost of a cell within WALL_MARGIN of an inflated one. Paths keep out unless a gap is too narrow
 EIGHT_NEIGHBOURS = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc]
 STEPS = [(dr, dc, math.hypot(dr, dc)) for dr, dc in EIGHT_NEIGHBOURS] # (row, col) step and its length in cells
 
@@ -400,7 +405,8 @@ class ObstacleCourseNode(Node):
         self.get_logger().info(f"{self.state}: moving obstacle ahead")
 
     def hold(self):
-        '''Approach a moving obstacle's sweep zone and face it, then cross once the obstacle has moved out of the way.
+        '''Wait for a moving obstacle to pass, standing still while it's in the crossing, then cross. While the crossing
+        is clear and the obstacle hasn't passed yet, approach the sweep zone and face it.
         Everything is recomputed every tick, because the sweep zone grows while the robot watches'''
         self.replan_if_due()
         path = None if self.path is None else self.path_ahead()
@@ -411,28 +417,21 @@ class ObstacleCourseNode(Node):
             return
         start, end = crossing
         out = min(end + int(np.ceil(ARRIVE_TOL / CourseMap.CELL_SIZE)), len(path) - 1) # ARRIVE_TOL past the zone's reach
-        if start == 0: # already within reach, because the zone grew around the robot: leave by the shortest route
-            cost, blocked, reach = self.course_map.planning_grids()
-            outside = ~dilate(reach, disk(ARRIVE_TOL, CourseMap.CELL_SIZE)) & ~blocked # ARRIVE_TOL clear of reach
-            cells = plan_path(cost, self.course_map.to_cell(self.pose[:2]), outside)
-            if cells is not None:
-                self.cross_path = self.course_map.cells_to_world(np.array(cells))
-                self.state = CROSS
-                self.get_logger().info(f"{self.state}: within reach of a moving obstacle, leaving")
-            else:
-                self.drive(0.0, 0.0) # no way out: stay put rather than keep the last command
-            return
-
         blocked = self.crossing_blocked(path[start:end])
         self.seen_blocked |= blocked
-        if not self.follow(path[:start]):
-            return # still driving to the hold point, just outside the zone's reach
-        # Cross as soon as the obstacle is out of the way. Having just left, it is moving away, so the crossing behind
-        # it stays clear longest. A crossing that has been clear since the robot arrived may have it on its way back
-        if self.seen_blocked and not blocked:
+        if blocked:
+            self.drive(0.0, 0.0) # stay still, wherever the robot is, until the obstacle has passed
+            return
+        # Cross once the obstacle has passed: seen in the crossing during this hold, and now out of it. Having just
+        # left, it is moving away. A crossing that has been clear since the robot arrived may have it on its way back
+        if self.seen_blocked:
             self.cross_path = path[:out + 1]
             self.state = CROSS
-            self.get_logger().info(f"{self.state}: moving obstacle out of the way")
+            self.get_logger().info(f"{self.state}: moving obstacle has passed")
+            return
+        # Until then, approach the hold point while the crossing is clear. If the sweep zone has grown around the
+        # robot (start == 0), it's already as close as it gets: it stays where it is rather than looking for a way out
+        if start > 0 and not self.follow(path[:start]):
             return
         # Face the far end of the crossing while waiting. It follows the sweep zone, so unlike the carrot it barely
         # moves when the path is replanned, and the robot doesn't keep turning (and skipping scans)
@@ -444,8 +443,8 @@ class ObstacleCourseNode(Node):
         self.drive(0.0, 0.0)
 
     def cross(self):
-        '''Drive through the crossing, or out of reach, without stopping. Then go back to exploring'''
-        if self.follow(self.cross_path, safety=False, reverse=True):
+        '''Drive through the crossing without stopping. Then go back to exploring'''
+        if self.follow(self.cross_path, safety=False):
             self.state = EXPLORE
             self.plan_time = -math.inf # replan at once
             self.get_logger().info(f"{self.state}: crossed")
@@ -526,20 +525,12 @@ class ObstacleCourseNode(Node):
         dx, dy = (path[i + far[0]] if len(far) else path[-1]) - self.pose[:2]
         return remaining, math.radians(wrap_deg(math.degrees(math.atan2(dy, dx)) - self.pose[2]))
 
-    def follow(self, path:np.ndarray, safety:bool=True, reverse:bool=False) -> bool:
-        '''Drive along path with pure pursuit. Returns True once the robot has reached the end.
-        With reverse, back up instead of turning round when the carrot is behind the robot'''
+    def follow(self, path:np.ndarray, safety:bool=True) -> bool:
+        '''Drive along path with pure pursuit. Returns True once the robot has reached the end'''
         remaining, alpha = self.carrot(path)
         if remaining < ARRIVE_TOL:
             self.drive(0.0, 0.0)
             return True
-        if reverse and abs(alpha) > math.pi / 2:
-            backward = math.atan2(math.sin(alpha + math.pi), math.cos(alpha + math.pi)) # the carrot's angle from the rear
-            if abs(backward) > TURN_IN_PLACE: # as when driving forward. Near 90 off, the arc's speed and turn are both ~0
-                self.turn_in_place(backward) # turning by the rear's angle swings the rear towards the carrot
-                return False
-            self.drive(-MAX_SPEED * math.cos(backward), 2 * MAX_SPEED * math.cos(backward) * math.sin(backward) / LOOKAHEAD)
-            return False
         if abs(alpha) > TURN_IN_PLACE:
             self.turn_in_place(alpha)
             return False
@@ -707,7 +698,8 @@ class CourseMap:
         '''Returns (cost, blocked, reach), all the same shape as occupancy_map.
         blocked: within half the robot's width of an occupied cell, so the robot's centre shouldn't go there.
         reach: within SWEEP_CLEARANCE of the sweep zone, where a moving obstacle can touch the robot.
-        cost: cost of entering each cell. inf if occupied, INFLATED if blocked, otherwise higher the closer it is to a wall'''
+        cost: cost of entering each cell. inf if occupied, INFLATED if blocked, otherwise higher the closer it is to a wall,
+        and up to MARGIN_COST more within WALL_MARGIN of blocked'''
         occupied = self.occupancy_map > self.OCCUPIED
         blocked = dilate(occupied, disk(ROBOT_WIDTH / 2, self.CELL_SIZE))
 
@@ -720,6 +712,10 @@ class CourseMap:
             near = dilate(near, EIGHT_NEIGHBOURS)
 
         cost = 1.0 + CLEARANCE_WEIGHT * (clear_max - clearance) / clear_max
+        # The wall margin costs a lot but can still be entered, so a gap only a little wider than the robot stays open.
+        # It's graded, highest next to blocked, so in such a gap the middle is still cheapest
+        margin_cells = WALL_MARGIN / self.CELL_SIZE
+        cost += MARGIN_COST * np.clip((margin_cells + 1 - clearance) / margin_cells, 0.0, 1.0)
         cost[blocked] = INFLATED
         cost[occupied] = np.inf
         reach = dilate(self.dynamic_map >= 0, disk(SWEEP_CLEARANCE, self.CELL_SIZE))
