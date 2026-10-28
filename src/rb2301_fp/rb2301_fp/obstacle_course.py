@@ -233,6 +233,7 @@ class ObstacleCourseNode(Node):
         self.path = self.target = None # current path (world points) and where it leads
         self.to_end = False # True once nothing is left to explore and the target is the end of the course
         self.plan_time = -math.inf # when the path was last planned
+        self.busy = [] # world points on moving obstacles' paths where no window was long enough to cross
 
     def sub_scan_callback(self, msg):
         """Scan subscriber. Also adds the scan to the map"""
@@ -379,6 +380,18 @@ class ObstacleCourseNode(Node):
                 self.clear_since = now
             self.was_blocked = blocked
 
+        crossing_length = np.sum(np.linalg.norm(np.diff(path[start - 1:out + 1], axis=0), axis=1))
+        cross_time = crossing_length / MAX_SPEED + MAX_SPEED / (2 * MAX_ACCEL) # + time lost ramping up
+        # The windows repeat every cycle, and the last two make up one cycle. If neither is long enough, waiting here
+        # can't help. Near the ends of the obstacle's path the windows are longer, so try crossing further along it
+        if len(self.windows) >= 2 and max(self.windows[-2:]) < cross_time:
+            self.busy.append(path[(start + end) // 2])
+            self.state = EXPLORE
+            self.plan_time = -math.inf # replan at once, around this spot
+            self.get_logger().info(f"{self.state}: windows {self.windows[-2]:.1f} s and {self.windows[-1]:.1f} s, "
+                                   f"need {cross_time:.1f} s, crossing elsewhere")
+            return
+
         if not self.follow(path[:start]):
             return # still driving to the hold point, just outside the zone's reach
         # Face the far end of the crossing. It follows the sweep zone, so unlike the carrot it barely moves when the path
@@ -392,8 +405,6 @@ class ObstacleCourseNode(Node):
 
         # The obstacle repeats its motion, so the window one cycle ago, two windows back, shows how long the one
         # starting now will last. Near one end of the obstacle's path, windows alternate long and short
-        crossing_length = np.sum(np.linalg.norm(np.diff(path[start - 1:out + 1], axis=0), axis=1))
-        cross_time = crossing_length / MAX_SPEED + MAX_SPEED / (2 * MAX_ACCEL) # + time lost ramping up
         if window_started and len(self.windows) >= 2 and self.windows[-2] >= cross_time:
             self.cross_path = path[:out + 1]
             self.state = CROSS
@@ -422,6 +433,8 @@ class ObstacleCourseNode(Node):
         With no frontier left, head for the end of the course: the reachable cell farthest from the start.
         Sets self.path (world points) and self.target, both None if nothing can be reached'''
         cost, blocked, reach = self.course_map.planning_grids()
+        for point in self.busy: # paths go round places where no window was long enough, a robot's width either side
+            cost[self.course_map.within(point, ROBOT_WIDTH)] = INFLATED
         allowed = self.course_map.ahead(self.start) & ~blocked & ~reach # where a target may be
         frontier = self.course_map.frontier(allowed)
         start = self.course_map.to_cell(self.pose[:2])
@@ -477,6 +490,9 @@ class ObstacleCourseNode(Node):
             return True
         if reverse and abs(alpha) > math.pi / 2:
             backward = math.atan2(math.sin(alpha + math.pi), math.cos(alpha + math.pi)) # the carrot's angle from the rear
+            if abs(backward) > TURN_IN_PLACE: # as when driving forward. Near 90 off, the arc's speed and turn are both ~0
+                self.turn_in_place(backward) # turning by the rear's angle swings the rear towards the carrot
+                return False
             self.drive(-MAX_SPEED * math.cos(backward), 2 * MAX_SPEED * math.cos(backward) * math.sin(backward) / LOOKAHEAD)
             return False
         if abs(alpha) > TURN_IN_PLACE:
@@ -655,6 +671,13 @@ class CourseMap:
         y = self.origin[1] + (np.arange(rows) + 0.5) * self.CELL_SIZE
         heading = np.deg2rad(pose[2])
         return (x[None, :] - pose[0]) * np.cos(heading) + (y[:, None] - pose[1]) * np.sin(heading) > 0
+
+    def within(self, point:np.ndarray, radius:float) -> np.ndarray:
+        '''True for cells whose centre is within radius of a world point'''
+        rows, cols = self.occupancy_map.shape
+        x = self.origin[0] + (np.arange(cols) + 0.5) * self.CELL_SIZE
+        y = self.origin[1] + (np.arange(rows) + 0.5) * self.CELL_SIZE
+        return (x[None, :] - point[0]) ** 2 + (y[:, None] - point[1]) ** 2 < radius ** 2
 
     def frontier(self, allowed:np.ndarray) -> np.ndarray:
         '''Free cells next to an unknown cell, inside allowed'''
