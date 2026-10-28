@@ -65,9 +65,12 @@ ROBOT_LENGTH = 0.289 # m
 # cell's diagonal, because the hits and the path are both cell centres, each up to half a cell's diagonal off
 SWEEP_CLEARANCE = math.hypot(ROBOT_WIDTH, ROBOT_LENGTH) / 2 + math.sqrt(2) * 0.025
 
-# LiDAR mounting, from the URDF (laser_joint). It faces backwards, so beam angle 0 points behind the robot
-LIDAR_X = 0.114 # m ahead of the robot's centre
-LIDAR_YAW = math.pi # rad, from the robot's heading to the LiDAR's angle 0
+# LiDAR mounting: how far ahead of the robot's centre it is (m), and the angle from the robot's heading to the LiDAR's
+# angle 0 (rad). Gazebo's comes from the URDF (laser_joint): it faces backwards, so its angle 0 points behind the robot.
+# The real robot's has to be measured: run ./fp.sh --calibrate with a box in front of the robot (PLAN.md section 10)
+SIM_LIDAR_X, SIM_LIDAR_YAW = 0.114, math.pi
+REAL_LIDAR_X, REAL_LIDAR_YAW = 0.114, math.pi
+SELF_MARGIN = 0.03 # m. A return within this of the robot's footprint is the robot itself (markers, cables), not the course
 
 # Driving
 DT = 0.05 # s, timer period
@@ -176,11 +179,14 @@ class LidarNode(Node):
         self.is_simulation = None
 
     def sub_scan_callback(self, msg):
-        """Scan subscriber"""
-        if len(msg.ranges) <= 360: 
-            self.is_simulation = True
-        else:
-            self.is_simulation = False
+        """Scan subscriber. Gazebo's bridge publishes the simulation clock on /clock, and the real robot never does.
+        The scan's size isn't reliable: a real LiDAR can send 360 beams or fewer too"""
+        topics = [name for name, _ in self.get_topic_names_and_types()]
+        self.is_simulation = "/clock" in topics
+        self.get_logger().info(f"{'Simulation' if self.is_simulation else 'Real robot'}: /clock is "
+                               f"{'' if self.is_simulation else 'not '}published. LiDAR: {len(msg.ranges)} beams, "
+                               f"angles {msg.angle_min:+.3f} to {msg.angle_max:+.3f} rad every {msg.angle_increment:.4f}, "
+                               f"ranges {msg.range_min:.2f} to {msg.range_max:.1f} m, {msg.time_increment * 1e3:.3f} ms between beams")
 
 class ObstacleCourseNode(Node):
     '''Node to navigate obstacle course, using pose from either gazebo odometer or optitrack and lidar scan data'''
@@ -197,7 +203,8 @@ class ObstacleCourseNode(Node):
         if is_simulation:
             self.max_translate_velocity = 1.4
         else:
-            self.max_translate_velocity = 0.3 # Please keep this in place; 0.3m/s is more than fast enough 
+            self.max_translate_velocity = 0.3 # Please keep this in place; 0.3m/s is more than fast enough
+        self.lidar_x, self.lidar_yaw = (SIM_LIDAR_X, SIM_LIDAR_YAW) if is_simulation else (REAL_LIDAR_X, REAL_LIDAR_YAW)
 
         self.sub_scan = self.create_subscription(LaserScan, "scan", self.sub_scan_callback, 2) # Subscribe to LiDAR scan data
 
@@ -223,7 +230,9 @@ class ObstacleCourseNode(Node):
         self.timer = self.create_timer(0.05, self.timer_callback)  # Runs at 20Hz. Can be changed.
 
         self.pose = None
-        self.pose_history = deque(maxlen=100) # recent (stamp, x, y, heading), to find the pose when each scan was taken
+        self.pose_history = deque(maxlen=100) # recent (stamp, x, y, heading), to find the pose when each beam was taken
+        self.scan = None # latest LiDAR scan
+        self.trail = [] # pose at each scan added to the map, saved with the map on exit
 
         self.course_map = None # created at the first scan with a pose
         self.scan_count = 0 # number of scans added to the map
@@ -245,26 +254,44 @@ class ObstacleCourseNode(Node):
             self.course_map = CourseMap(self.pose[0], self.pose[1])
             self.start = self.pose.copy() # only frontiers ahead of this pose count
 
-        # The scan can wait in the queue while another callback runs, so the latest pose may be newer than the scan
-        pose = self.pose_at(stamp_seconds(msg.header.stamp))
-        ranges = np.array(msg.ranges)
-        ranges[ranges < msg.range_min] = np.nan
-        heading = np.deg2rad(pose[2])
-        angles = heading + LIDAR_YAW + msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
-        lidar_xy = pose[:2] + LIDAR_X * np.array((np.cos(heading), np.sin(heading)))
+        ranges, angles, _, _ = self.scan_points(msg)
+        # Place each beam from the pose when it was taken. A real LiDAR takes a tenth of a second or more to sweep, so
+        # while the robot turns, the last beams see the room from a different heading than the first. And the scan can
+        # wait in the queue while another callback runs, so the latest pose may be newer than the whole scan
+        poses = self.pose_at(stamp_seconds(msg.header.stamp) + np.arange(len(ranges)) * msg.time_increment)
+        heading = np.deg2rad(poses[:, 2])
+        lidar_xy = poses[:, :2] + self.lidar_x * np.stack((np.cos(heading), np.sin(heading)), axis=1)
         self.scan_count += 1
-        self.course_map.update(lidar_xy, angles, ranges, CourseMap.CELL_SIZE / msg.angle_increment, self.scan_count)
+        self.course_map.update(lidar_xy, heading + angles, ranges, CourseMap.CELL_SIZE / msg.angle_increment, self.scan_count)
+        self.trail.append(self.pose.copy())
 
-    def pose_at(self, t:float) -> np.ndarray:
-        '''Pose [x, y, heading] at stamp t, interpolated between the recent poses. The latest pose if t isn't between them,
-        such as when the pose source stops publishing while the robot stands still, or its clock differs from the LiDAR's'''
+    def scan_points(self, msg) -> tuple:
+        '''A scan's ranges, each beam's angle from the robot's heading (rad), and the returns' (x, y) from the robot's
+        centre, x ahead and y to the left. Returns off the robot's own body, or under range_min, are nan'''
+        ranges = np.array(msg.ranges, dtype=float)
+        ranges[~(ranges >= msg.range_min)] = np.nan
+        angles = self.lidar_yaw + msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
+        with np.errstate(invalid="ignore"): # inf ranges
+            x, y = self.lidar_x + ranges * np.cos(angles), ranges * np.sin(angles)
+        on_robot = (np.abs(x) < ROBOT_LENGTH / 2 + SELF_MARGIN) & (np.abs(y) < ROBOT_WIDTH / 2 + SELF_MARGIN)
+        ranges[on_robot] = x[on_robot] = y[on_robot] = np.nan
+        return ranges, angles, x, y
+
+    def pose_at(self, t) -> np.ndarray:
+        '''Pose [x, y, heading] at stamp t, interpolated between the recent poses. t can be an array, for one pose per
+        stamp. The latest pose where t isn't between them, such as when the pose source stops publishing while the robot
+        stands still, or its clock differs from the LiDAR's'''
+        t = np.asarray(t, dtype=float)
+        latest = np.broadcast_to(self.pose, t.shape + (3,))
         history = np.array(self.pose_history)
-        if len(history) < 2 or not history[0, 0] <= t <= history[-1, 0]:
-            return self.pose
-        i = min(max(int(np.searchsorted(history[:, 0], t)), 1), len(history) - 1)
-        (t0, x0, y0, h0), (t1, x1, y1, h1) = history[i - 1], history[i]
-        f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
-        return np.array((x0 + f * (x1 - x0), y0 + f * (y1 - y0), wrap_deg(h0 + f * wrap_deg(h1 - h0))))
+        if len(history) < 2:
+            return latest.copy()
+        stamps = history[:, 0]
+        heading = np.rad2deg(np.unwrap(np.deg2rad(history[:, 3])))
+        interpolated = np.stack((np.interp(t, stamps, history[:, 1]), np.interp(t, stamps, history[:, 2]),
+                                 wrap_deg(np.interp(t, stamps, heading))), axis=-1)
+        inside = (t >= stamps[0]) & (t <= stamps[-1])
+        return np.where(inside[..., None], interpolated, latest)
 
     def yaw_from_quaternion(self, q):
         '''Returns yaw angle (in rad) for orientation based on given quaternion input q'''
@@ -313,11 +340,10 @@ class ObstacleCourseNode(Node):
             print("No pose detected")
             return # Does not run if no pose received from Odom or Optitrack
 
-        if self.calibrate and self.raw_pose is not None:
+        if self.calibrate:
             self._ticks += 1
             if self._ticks % 10 == 0: # twice a second
-                ox, oy, oh = self.raw_pose
-                self.get_logger().info(f"optitrack ({ox:+.3f}, {oy:+.3f}, {oh:+7.1f} deg)  ->  maze ({self.pose[0]:+.3f}, {self.pose[1]:+.3f}, {self.pose[2]:+7.1f} deg)")
+                self.print_calibration()
             return # Calibration mode: look, don't drive
 
         ###### INSERT CODE HERE ######
@@ -330,6 +356,34 @@ class ObstacleCourseNode(Node):
         else:
             self.cross()
         ###### INSERT CODE HERE ######
+
+    def print_calibration(self):
+        '''--calibrate: the pose, and where the LiDAR's returns are around the robot, as the map will use them.
+        With a box straight in front of the robot, the nearest return should read about 0 deg'''
+        log = self.get_logger()
+        if self.raw_pose is not None:
+            ox, oy, oh = self.raw_pose
+            log.info(f"optitrack ({ox:+.3f}, {oy:+.3f}, {oh:+7.1f} deg)  ->  maze ({self.pose[0]:+.3f}, {self.pose[1]:+.3f}, {self.pose[2]:+7.1f} deg)")
+        else:
+            log.info(f"pose ({self.pose[0]:+.3f}, {self.pose[1]:+.3f}, {self.pose[2]:+7.1f} deg)")
+        if self.scan is None:
+            log.info("no LiDAR scan yet")
+            return
+        _, _, x, y = self.scan_points(self.scan)
+        distance, bearing = np.hypot(x, y), np.degrees(np.arctan2(y, x)) # from the robot's centre, 0 = ahead, +90 = left
+        seen = np.isfinite(distance)
+        if not seen.any():
+            log.info("LiDAR: no returns")
+            return
+        def towards(deg):
+            near = seen & (np.abs(wrap_deg(bearing - deg)) < 5)
+            return f"{np.min(distance[near]):.2f} m" if near.any() else "-"
+        i = int(np.nanargmin(distance))
+        # If the nearest thing is really straight ahead, this LiDAR yaw would make it read 0 deg
+        fixed_yaw = math.radians(wrap_deg(math.degrees(self.lidar_yaw) - bearing[i]))
+        log.info(f"LiDAR nearest {distance[i]:.2f} m at {bearing[i]:+.0f} deg (0 = ahead, +90 = left) | "
+                 f"ahead {towards(0)}, left {towards(90)}, behind {towards(180)}, right {towards(-90)} | "
+                 f"if the nearest thing is straight ahead, the LiDAR yaw should be {fixed_yaw:+.2f} rad (now {self.lidar_yaw:+.2f})")
 
     def explore(self):
         '''Follow the path to the target, replanning every REPLAN_PERIOD. Hold when it leads past a moving obstacle'''
@@ -513,9 +567,8 @@ class ObstacleCourseNode(Node):
 
     def blocked_ahead(self) -> bool:
         '''True if a LiDAR return is within STOP_DISTANCE in front of the robot's front edge'''
-        ranges = np.nan_to_num(np.array(self.scan.ranges), posinf=0.0) # no return -> 0, which never counts
-        angles = LIDAR_YAW + self.scan.angle_min + np.arange(len(ranges)) * self.scan.angle_increment
-        x, y = LIDAR_X + ranges * np.cos(angles), ranges * np.sin(angles) # from the robot's centre
+        _, _, x, y = self.scan_points(self.scan)
+        x, y = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), np.nan_to_num(y) # no return -> 0, which never counts
         ahead = (x > ROBOT_LENGTH / 2) & (x < ROBOT_LENGTH / 2 + STOP_DISTANCE) # beside the body, stopping can't help
         return bool(np.any(ahead & (np.abs(y) < ROBOT_WIDTH / 2)))
 
@@ -602,7 +655,11 @@ class CourseMap:
         self.origin = self.origin - before * self.CELL_SIZE
 
     def update(self, lidar_xy: np.ndarray, angles: np.ndarray, ranges: np.ndarray, max_range: float, scan_number: int):
+        '''Add a scan. lidar_xy is where the LiDAR was, either one (x, y) or one per beam'''
         valid = np.isfinite(ranges)
+        if not valid.any():
+            return
+        lidar_xy = np.broadcast_to(lidar_xy, (len(ranges), 2))[valid]
         angles, ranges = angles[valid], ranges[valid]
 
         is_hit = ranges <= max_range
@@ -615,7 +672,7 @@ class CourseMap:
         steps = np.arange(0.0, max_range, self.CELL_SIZE / 2)
         before_end = steps[None, :] < ranges[:, None] - self.CELL_SIZE
 
-        samples = lidar_xy + steps[None, :, None] * directions[:, None, :]
+        samples = lidar_xy[:, None, :] + steps[None, :, None] * directions[:, None, :]
         free = self.to_flat_cells(samples[before_end])
         hits = self.to_flat_cells(ends[is_hit])
 
@@ -684,7 +741,7 @@ def main(args=None):
     print("Starting obstacle course")
     rclpy.init(args=ros_args)
 
-    # Use lidar scan length to determine if in simulation or not
+    # Wait for the LiDAR, then tell simulation from the real robot by Gazebo's /clock
     lidar = LidarNode()
     while lidar.is_simulation is None:
         rclpy.spin_once(lidar)
@@ -695,10 +752,25 @@ def main(args=None):
     obstacle = ObstacleCourseNode(is_simulation, cli_args.calibrate)
     try:
         rclpy.spin(obstacle)
-    except SystemExit:
+    except (SystemExit, KeyboardInterrupt):
         print("Shutting down")
+    try:
+        obstacle.move_2D(0.0, 0.0, 0.0) # the base keeps the last command it was sent
+    except Exception: # the context may already be shut down by Ctrl+C
+        pass
+    save_map(obstacle)
     obstacle.destroy_node()
-    rclpy.shutdown()
+    if rclpy.ok():
+        rclpy.shutdown()
+
+def save_map(node:ObstacleCourseNode, path:str="fp_map.npz"):
+    '''Save what the robot mapped, to check a run on a laptop (PLAN.md section 10)'''
+    if node.course_map is None:
+        return
+    m = node.course_map
+    np.savez(path, occupancy=m.occupancy_map, dynamic=m.dynamic_map, origin=m.origin, cell_size=m.CELL_SIZE,
+             trail=np.array(node.trail))
+    print(f"Saved the map to {os.path.abspath(path)}")
 
 if __name__ == '__main__':
     main()
