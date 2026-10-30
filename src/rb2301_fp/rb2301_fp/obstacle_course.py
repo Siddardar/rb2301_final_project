@@ -1,6 +1,5 @@
 import argparse
 import configparser
-import heapq
 import math
 import os
 import numpy as np
@@ -53,109 +52,65 @@ def load_frame(robot_number:int) -> tuple:
     course = {k: parser.getfloat("course", k, fallback=0.0) for k in ("origin_x", "origin_y", "rotation_deg")}
     return frame, course
 
-# Robot size, from CA1
-ROBOT_WIDTH = 0.225 # m
-ROBOT_LENGTH = 0.289 # m
-SWEEP_CLEARANCE = math.hypot(ROBOT_WIDTH, ROBOT_LENGTH) / 2 # m. Any closer to a moving obstacle and the robot can touch it, whatever its heading
+def bounce(y0:np.ndarray, vy:float, t:np.ndarray, lo:float, hi:float) -> np.ndarray:
+    '''Position at times t of a point starting at y0 with speed vy that bounces back and forth between lo and hi'''
+    span = max(hi - lo, 1e-3)
+    m = np.mod(np.clip(y0, lo, hi) - lo + vy * t, 2 * span)
+    return lo + np.where(m < span, m, 2 * span - m)
 
-# Driving
+
+# Robot size (m). Gazebo's pose is the rear axle (rear wheels at x = 0 in the URDF), the body centre is ahead of it
+ROBOT_WIDTH = 0.225
+ROBOT_LENGTH = 0.289
+SIM_BODY_OFFSET, REAL_BODY_OFFSET = 0.074, 0.0 # m, body centre ahead of the pose. Optitrack's rigid body is taken as the body centre
+SIM_LIDAR_X, REAL_LIDAR_X = 0.114, 0.040 # m, LiDAR ahead of the pose
+LIDAR_YAW = math.pi # rad, the LiDAR is mounted backwards (laser_joint yaw), so its angle 0 points behind the robot
+
+DIRECTION_DODGE = True # Stage 2: while crossing, move towards the side the moving obstacle is leaving
+
 DT = 0.05 # s, timer period
-MAX_SPEED = 0.3 # m/s, the real robot's limit
-MAX_ACCEL = 0.5 # m/s^2. Speed ramps up at most this fast, but drops at once
-MAX_TURN = 0.6 # rad/s, move_2D's turn limit on the real robot
-MIN_TURN = 0.3 # rad/s. From CA2: the real robot doesn't turn any slower than this
-TURN_GAIN = 1.5 # rad/s of turn per rad of heading error, when turning in place
-LOOKAHEAD = 0.2 # m, how far along the path the carrot is
-TURN_IN_PLACE = math.radians(60) # turn in place when the carrot is further off the heading than this
-ALIGN_TOL = math.radians(3) # heading errors smaller than this count as zero
-ARRIVE_TOL = 0.05 # m, how close to the end of a path counts as arriving
-STOP_DISTANCE = 0.1 # m. Stop if a LiDAR return is this close in front of the robot's front edge
-REPLAN_PERIOD = 1.0 # s
+LOOKAHEAD = 0.6 # m, how far ahead each candidate direction has to be free
+WALL_MARGIN = 0.08 # m kept from walls and static obstacles where there's room ...
+MIN_MARGIN = 0.03 # m ... and where there isn't
+STOP_GAP = 0.05 # m. Never drive closer than this to anything in front of (or behind, when reversing) the body
+LANE_LOOK = 1.2 # m. A lane has to be clear this far ahead (or up to the wall at the end of the corridor)
+LANE_CARROT = 0.45 # m. Steer at a point this far ahead in the chosen lane (closer when something is close ahead)
+STUCK_TIME = 2.0 # s. Moved less than STUCK_MOVE in this long while trying to drive: turn on the spot to a clear heading and go forward,
+STUCK_MOVE = 0.05 # m
+UNSTICK_CLEAR = 0.3 # m ... a heading with at least this much free ahead ...
+ROTATE_TIMEOUT = 4.0 # s ... turning for at most this long ...
+UNSTICK_FORWARD_TIME = 1.0 # s ... then driving along it for this long
+RECOVER_TIME = 1.0 # s. No clear heading to turn to: back off for this long instead
+BLOCKED_TIME = 8.0 # s. A lane the robot got stuck in is avoided for this long
+HEADING_GAIN = 2.0 # rad/s of turn per rad of heading error
+TURN_ACCEL = 4.0 # rad/s^2. Turn rate changes at most this fast, so turns start and end smoothly
+TURN_IN_PLACE = math.radians(60) # Turn on the spot when the heading error is larger than this
+MIN_TURN = 0.3 # rad/s. Neither robot (real or Gazebo) turns on the spot any slower than this
 
-# Planning
-INFLATED = 1000.0 # cost of a cell within half the robot's width of an occupied cell
-CLEARANCE_WEIGHT = 4.0 # extra cost of a cell right next to an inflated one. Keeps paths in the middle of gaps
-EIGHT_NEIGHBOURS = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc]
-STEPS = [(dr, dc, math.hypot(dr, dc)) for dr, dc in EIGHT_NEIGHBOURS] # (row, col) step and its length in cells
+CORNER_EAST_FRONT = 0.7 # m from the body centre to the wall ahead at which the first corridor turns south
+CORNER_SOUTH_FRONT = 0.95 # m ... at which the second corridor turns east
+OPEN_RANGE = 0.5 # m. A side counts as open when most returns in that direction are further than this ...
+OPEN_JUMP = 0.3 # m ... and further than this beyond where the side wall was earlier in the corridor
 
-EXPLORE, HOLD, CROSS = "EXPLORE", "HOLD", "CROSS"
+DOOR_MIN, DOOR_MAX = 0.28, 0.65 # m, accepted door widths
+DOOR_CARROT = 0.35 # m. Aim this far ahead along the line through the middle of the door
+DOOR_LINE_UP = 0.55 # m. Line up at a point this far in front of the door (body centre)
+LINE_UP_PIVOT = 20.0 # deg. When the line-up point is further off the heading than this, turn on the spot to face it
+DOOR_STANDOFF = 0.3 # m from the body front to the door wall at which alignment is checked
+DOOR_TOL = 0.05 # m, largest sideways error allowed into the door
 
-def dilate(mask:np.ndarray, offsets) -> np.ndarray:
-    '''Grow the True cells of mask: a cell becomes True if a True cell is any (row, col) offset away from it'''
-    grown = mask.copy()
-    rows, cols = mask.shape
-    for dr, dc in offsets:
-        # grown[r + dr, c + dc] |= mask[r, c], for every cell at once
-        grown[max(dr, 0):rows + min(dr, 0), max(dc, 0):cols + min(dc, 0)] |= \
-            mask[max(-dr, 0):rows + min(-dr, 0), max(-dc, 0):cols + min(-dc, 0)]
-    return grown
-
-def disk(radius:float, cell_size:float) -> list:
-    '''(row, col) offsets of every cell within radius, rounded up to whole cells'''
-    r = int(np.ceil(radius / cell_size))
-    return [(dr, dc) for dr in range(-r, r + 1) for dc in range(-r, r + 1) if dr * dr + dc * dc <= r * r]
-
-def search(cost:np.ndarray, start:tuple, goal_mask:np.ndarray=None, goal:tuple=None) -> tuple:
-    '''Lowest-cost search over 8-connected cells from start (row, col).
-    With goal_mask, it stops at the first True cell it reaches: the nearest one by path cost. Without it, it reaches
-    every cell it can. With goal (row, col) it is A*, with the octile distance to goal as the heuristic, otherwise Dijkstra.
-    A path can leave an inflated cell but never enter one from a cell that isn't, so a robot that has drifted
-    close to a wall can still get out.
-    Returns (reached, parent, g): the goal cell reached (None if none), and each cell's parent and cost from start'''
-    cost = cost.copy()
-    cost[[0, -1], :] = np.inf # block the border, so neighbours never fall outside the grid
-    cost[:, [0, -1]] = np.inf
-    cost = cost.tolist() # lists are faster than numpy arrays for one cell at a time
-    if goal_mask is not None:
-        goal_mask = goal_mask.tolist()
-
-    def heuristic(r, c):
-        if goal is None:
-            return 0.0
-        dr, dc = abs(r - goal[0]), abs(c - goal[1])
-        return max(dr, dc) + (math.sqrt(2) - 1) * min(dr, dc)
-
-    g = {start: 0.0} # lowest cost found so far from start to each cell
-    parent = {start: None}
-    heap = [(heuristic(*start), start)]
-    closed = set()
-    while heap:
-        _, cell = heapq.heappop(heap)
-        if cell in closed:
-            continue
-        closed.add(cell)
-        r, c = cell
-        if goal_mask is not None and goal_mask[r][c]:
-            return cell, parent, g
-        inflated = cost[r][c] >= INFLATED
-        for dr, dc, length in STEPS:
-            nr, nc = r + dr, c + dc
-            step_cost = cost[nr][nc]
-            if step_cost == math.inf or (step_cost >= INFLATED and not inflated):
-                continue
-            new_g = g[cell] + length * step_cost
-            if new_g < g.get((nr, nc), math.inf):
-                g[(nr, nc)] = new_g
-                parent[(nr, nc)] = cell
-                heapq.heappush(heap, (new_g + heuristic(nr, nc), (nr, nc)))
-    return None, parent, g
-
-def plan_path(cost:np.ndarray, start:tuple, goal_mask:np.ndarray, goal:tuple=None):
-    '''Path from start to the nearest True cell of goal_mask as a list of (row, col), or None if none can be reached'''
-    cell, parent, _ = search(cost, start, goal_mask, goal)
-    if cell is None:
-        return None
-    path = []
-    while cell is not None:
-        path.append(cell)
-        cell = parent[cell]
-    return path[::-1]
-
-def plan_to(cost:np.ndarray, start:tuple, goal:tuple):
-    '''A* path from start to goal, both (row, col), or None if goal can't be reached'''
-    goal_mask = np.zeros(cost.shape, dtype=bool)
-    goal_mask[goal] = True
-    return plan_path(cost, start, goal_mask, goal)
+OBSTACLE_HALF = 0.15 # m, half the moving obstacle's width (0.3 m box)
+OBSTACLE_THICK = 0.025 # m, half its thickness
+WAIT_GAP = 0.15 # m kept between the body front and a moving obstacle's path while waiting
+OBSTACLE_MARGIN = 0.06 # m kept from a moving obstacle when crossing its path
+CROSS_CARROT = 0.4 # m, aim this far ahead when crossing
+CROSS_BRAKE = 4.0 # 1/s. Brake late and hard when crossing, so the body clears the obstacle's path quickly
+DODGE_SHIFT = 0.2 # m, sideways shift towards the side the moving obstacle is leaving (DIRECTION_DODGE)
+STATIC_WINDOW = 2.5 # s. Something in the way that moved less than STATIC_MOVE in this long is static, not moving
+STATIC_MOVE = 0.05 # m
+WAIT_TIMEOUT = 15.0 # s. Never wait longer than this (the slowest obstacle takes 12 s to come back), go round instead
+LOST_TIMEOUT = 1.5 # s. Nothing seen in the way for this long: go
+MIN_TRACK = 0.8 # s. Track a moving obstacle at least this long before trusting its speed
 
 class LidarNode(Node):
     def __init__(self):
@@ -213,31 +168,12 @@ class ObstacleCourseNode(Node):
 
         self.pose = None
 
-        self.course_map = None # created at the first scan with a pose
-        self.scan_count = 0 # number of scans added to the map
-        self.turning = False # True while turning in place. The map skips those scans
-        self.speed = 0.0 # last forward speed sent, for ramping up
-        self.state = EXPLORE
-        self.path = self.target = None # current path (world points) and where it leads
-        self.to_end = False # True once nothing is left to explore and the target is the end of the course
-        self.plan_time = -math.inf # when the path was last planned
-
     def sub_scan_callback(self, msg):
-        """Scan subscriber. Also adds the scan to the map"""
-        self.scan = msg
-        # This callback runs separately from timer_callback, so the pose check there doesn't cover it
-        if self.pose is None or self.turning:
-            return
-        if self.course_map is None:
-            self.course_map = CourseMap(self.pose[0], self.pose[1])
-            self.start = self.pose.copy() # only frontiers ahead of this pose count
-
-        ranges = np.array(msg.ranges)
-        ranges[ranges < msg.range_min] = np.nan
-        heading = np.deg2rad(self.pose[2])
-        angles = heading + msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
-        self.scan_count += 1
-        self.course_map.update(self.pose[:2], angles, ranges, CourseMap.CELL_SIZE / msg.angle_increment, self.scan_count)
+        """Scan subscriber"""
+        if len(msg.ranges) <= 360:
+            self.last_scan = np.array(msg.ranges)
+        else:
+            self.last_scan = np.array(msg.ranges)[::2] 
 
     def yaw_from_quaternion(self, q):
         '''Returns yaw angle (in rad) for orientation based on given quaternion input q'''
@@ -278,6 +214,482 @@ class ObstacleCourseNode(Node):
         twist_msg.angular.x, twist_msg.angular.y, twist_msg.angular.z = 0.0, 0.0, float(turn)
         self.publisher_.publish(twist_msg)
 
+    def setup_run(self):
+        '''One-off set-up on the first tick: course frame, sim/real tuning and the state machine'''
+        sim = self.is_simulation
+        self.start_pose = np.array(self.pose) # The course frame: the start pose is (0, 0) facing 0 deg
+        self.body_offset = SIM_BODY_OFFSET if sim else REAL_BODY_OFFSET
+        self.lidar_x = SIM_LIDAR_X if sim else REAL_LIDAR_X
+        self.cruise = 0.5 if sim else 0.25 # m/s
+        self.slow = 0.2 if sim else 0.1 # m/s, through the door and when reversing
+        self.cross_speed = 0.6 if sim else 0.3 # m/s, past the moving obstacles
+        self.max_turn = 1.5 if sim else 0.6 # rad/s
+        self.accel = 1.0 if sim else 0.5 # m/s^2
+        self.slew = 90.0 if sim else 45.0 # deg/s, how fast the wanted heading swings round at a corner
+        self.speed = self.turn = self.heading_cmd = 0.0
+        self.scan_ref = self.moved_from = None
+        self.lane = self.lane_heading = self.blocked = None # Lane planner: chosen lane, its corridor, a lane to avoid
+        self.door, self.door_hits = None, 0
+        self.line_up = DOOR_LINE_UP # m from the door wall to line up at (closer if something stands there)
+        self.bounds = None # (bottom, top) y of the corridor past the door
+        self.k = 0 # which moving obstacle is next
+        self.obstacles = [self.new_obstacle(), self.new_obstacle()]
+        self.t_start = self.t_state = self.t_log = self.t_stopped = self.clock()
+        self.state = None
+        self.set_state("CORRIDOR_EAST")
+
+    def clock(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def set_state(self, state:str):
+        self.get_logger().info(f"[{self.clock() - self.t_start:6.1f}s] {self.state} -> {state}")
+        self.state, self.t_state = state, self.clock()
+        self.t_stopped = self.t_state
+        self.unstick = None # Getting unstuck: (mode, target heading, until)
+        self.side_walls = [] # Where the side wall was, earlier in this corridor
+
+    def sense(self):
+        '''Pose and LiDAR returns in the course frame, refreshed every tick'''
+        self.now = self.clock()
+        x0, y0, h0 = self.start_pose
+        c0, s0 = math.cos(math.radians(h0)), math.sin(math.radians(h0))
+        dx, dy = self.pose[0] - x0, self.pose[1] - y0
+        self.cp = np.array((c0 * dx + s0 * dy, -s0 * dx + c0 * dy, wrap_deg(self.pose[2] - h0)))
+        h = math.radians(self.cp[2])
+        c, s = math.cos(h), math.sin(h)
+        self.body = self.cp[:2] + self.body_offset * np.array((c, s))
+        half_x = ROBOT_LENGTH / 2 * abs(c) + ROBOT_WIDTH / 2 * abs(s) # Body's half-extent along the course's x
+        self.front_x, self.rear_x = self.body[0] + half_x, self.body[0] - half_x
+        self.pts = self.scan_points()
+        self.cpts = self.cp[:2] + self.pts @ np.array(((c, s), (-s, c)))
+        self.new_scan = self.last_scan is not self.scan_ref
+        self.scan_ref = self.last_scan
+
+    def scan_points(self) -> np.ndarray:
+        '''Valid LiDAR returns as (N, 2) points in the robot frame (origin at the pose, +x forward)'''
+        ranges = np.asarray(self.last_scan, dtype=float)
+        n = len(ranges)
+        if self.is_simulation:
+            angles = -3.14 + np.arange(n) * 6.28 / (n - 1) + LIDAR_YAW # URDF: 360 samples from -3.14 to 3.14
+        else:
+            angles = -math.pi + np.arange(n) * 2 * math.pi / n + LIDAR_YAW
+        ok = np.isfinite(ranges) & (ranges > 0.06) & (ranges < 8.0)
+        r, a = ranges[ok], angles[ok]
+        pts = np.column_stack((self.lidar_x + r * np.cos(a), r * np.sin(a)))
+        on_robot = (np.abs(pts[:, 0] - self.body_offset) < ROBOT_LENGTH / 2 + 0.03) & (np.abs(pts[:, 1]) < ROBOT_WIDTH / 2 + 0.03)
+        return pts[~on_robot]
+
+    def sector(self, direction:float, half_width:float=10.0, percentile:float=0.0) -> float:
+        '''Distance from the body centre to the returns within half_width deg of a course-frame direction (deg).
+        percentile 0 is the closest; a high percentile asks "is this side mostly open?"'''
+        d = self.cpts - self.body
+        bearing = np.degrees(np.arctan2(d[:, 1], d[:, 0]))
+        sel = np.abs((bearing - direction + 180.0) % 360.0 - 180.0) < half_width
+        return float(np.percentile(np.hypot(d[sel, 0], d[sel, 1]), percentile)) if sel.any() else 10.0
+
+    def front_free(self, ignore:np.ndarray=None, behind:bool=False) -> float:
+        '''Free distance from the body's front edge (or rear edge) to the nearest return in the robot's own lane'''
+        pts = self.pts if ignore is None else self.pts[~ignore]
+        lane = np.abs(pts[:, 1]) < ROBOT_WIDTH / 2 + 0.01
+        if behind:
+            d = (self.body_offset - ROBOT_LENGTH / 2) - pts[lane, 0]
+        else:
+            d = pts[lane, 0] - (self.body_offset + ROBOT_LENGTH / 2)
+        d = d[d > -0.03]
+        return float(d.min()) if len(d) else 10.0
+
+    def steer(self, heading:float, ignore:np.ndarray=None) -> tuple:
+        '''Obstacle avoidance. Returns (direction to drive in, rad from the robot's heading; free distance that way).
+        Of the directions whose swept corridor (robot width + margin, LOOKAHEAD long) is clear, takes the one closest
+        to the wanted course-frame heading (deg), keeping WALL_MARGIN where there's room and MIN_MARGIN where there isn't'''
+        wanted = np.clip(math.radians(wrap_deg(heading - self.cp[2])), -math.pi / 2, math.pi / 2)
+        pts = self.pts if ignore is None else self.pts[~ignore]
+        if len(pts) == 0:
+            return wanted, LOOKAHEAD
+        thetas = np.radians(np.arange(-90, 91, 3))
+        px, py = pts[:, 0] - self.body_offset, pts[:, 1] # From the body centre
+        c, s = np.cos(thetas)[:, None], np.sin(thetas)[:, None]
+        along, lateral = px * c + py * s, -px * s + py * c
+        for margin in (WALL_MARGIN, MIN_MARGIN):
+            hit = (along > 0.0) & (along < LOOKAHEAD) & (np.abs(lateral) < ROBOT_WIDTH / 2 + margin)
+            free = np.where(hit, along, LOOKAHEAD).min(axis=1)
+            clear = free >= LOOKAHEAD
+            if clear.any():
+                i = int(np.argmin(np.where(clear, np.abs(thetas - wanted), np.inf)))
+                return float(thetas[i]), float(free[i])
+        i = int(np.argmax(free - 0.2 * np.abs(thetas - wanted))) # Nothing clear: the most open way, not too far round
+        return float(thetas[i]), float(free[i])
+
+    def lane_steer(self, heading:float):
+        '''Corridor driving along a course-frame heading (deg): of the sideways positions ("lanes") between the side
+        walls, take the one with the most clearance (up to WALL_MARGIN) from everything over the stretch ahead, keeping
+        to the previous lane, and steer onto it smoothly. Returns the heading error (rad), or None if no lane fits'''
+        h = math.radians(heading)
+        c, s = math.cos(h), math.sin(h)
+        d = self.cpts - self.body
+        along, lat = d[:, 0] * c + d[:, 1] * s, -d[:, 0] * s + d[:, 1] * c
+        # Wall at the end of the corridor: nearest return in each 5 cm strip across the way ahead. An end wall fills
+        # every strip, an obstacle only some, so a high percentile over the strips is the end wall, not the obstacle
+        band = (along > 0.05) & (np.abs(lat) < 0.5)
+        strips = np.full(20, LANE_LOOK + 1.0)
+        np.minimum.at(strips, np.clip(((lat[band] + 0.5) / 0.05).astype(int), 0, 19), along[band])
+        end = float(np.percentile(strips, 80))
+        reach = min(LANE_LOOK, end - 0.15)
+        window = (along > -ROBOT_LENGTH / 2) & (along < reach) & (np.abs(lat) < 1.5)
+        if reach < 0.2 or not window.any():
+            return None
+        beside = np.abs(along) < 0.3 # Lanes stay between the walls (or obstacles) right beside the robot
+        left = lat[beside & (lat > 0)].min() if (beside & (lat > 0)).any() else 1.0
+        right = lat[beside & (lat < 0)].max() if (beside & (lat < 0)).any() else -1.0
+        offsets = np.arange(-1.0, 1.0001, 0.02)
+        offsets = offsets[(offsets > right) & (offsets < left)]
+        if len(offsets) == 0:
+            return None
+        clear = np.abs(lat[window][None, :] - offsets[:, None]).min(axis=1)
+        fits = clear >= ROBOT_WIDTH / 2 + MIN_MARGIN
+        if not fits.any():
+            return None
+        body_lat = -self.body[0] * s + self.body[1] * c # Lanes are remembered across the corridor, not from the robot
+        if self.lane_heading != heading:
+            self.lane_heading, self.lane = heading, None
+        score = np.minimum(clear, ROBOT_WIDTH / 2 + WALL_MARGIN) - 0.15 * np.abs(offsets)
+        if self.lane is not None:
+            score -= 0.3 * np.abs(body_lat + offsets - self.lane)
+        if self.blocked is not None and self.blocked[1] == heading and self.now < self.blocked[2]:
+            score -= 0.3 * (np.abs(body_lat + offsets - self.blocked[0]) < 0.2) # Got stuck there: try another way
+        i = int(np.argmax(np.where(fits, score, -np.inf)))
+        self.lane = body_lat + offsets[i]
+        carrot = float(np.clip(self.front_free() + 0.1, 0.2, LANE_CARROT)) # Turn harder round something close
+        return self.heading_error(heading + math.degrees(math.atan2(offsets[i], carrot)))
+
+    def heading_error(self, heading:float) -> float:
+        '''Course-frame heading (deg) -> error from the robot's heading (rad)'''
+        return math.radians(wrap_deg(heading - self.cp[2]))
+
+    def slew_heading(self, target:float):
+        '''Swing the wanted heading towards target at a limited rate, so corners become smooth arcs'''
+        step = self.slew * DT
+        self.heading_cmd = wrap_deg(self.heading_cmd + np.clip(wrap_deg(target - self.heading_cmd), -step, step))
+
+    def drive(self, speed:float, error:float, ignore:np.ndarray=None, brake:float=1.5):
+        '''Car-like motion: forward speed and turn only. Turn is a P controller on the heading error with a limited
+        turn acceleration; speed slows with the heading error and with the free distance ahead, ramps up gently and
+        drops at once'''
+        if speed > 0:
+            speed = min(speed, max(0.0, brake * (self.front_free(ignore) - STOP_GAP)))
+        elif speed < 0 and self.front_free(behind=True) < STOP_GAP:
+            speed = 0.0
+        speed = 0.0 if abs(error) > TURN_IN_PLACE else speed * math.cos(error) ** 2
+        turn = float(np.clip(HEADING_GAIN * error, -self.max_turn, self.max_turn))
+        if speed == 0.0 and abs(error) > math.radians(1.5) and abs(turn) < MIN_TURN: # Slower turns stall on the spot
+            turn = math.copysign(MIN_TURN, turn)
+        step = TURN_ACCEL * DT
+        self.turn += float(np.clip(turn - self.turn, -step, step))
+        if abs(speed) > abs(self.speed) and speed * self.speed >= 0:
+            self.speed = math.copysign(min(abs(speed), abs(self.speed) + self.accel * DT), speed)
+        else:
+            self.speed = speed
+        if self.moved_from is None or math.hypot(*(self.body - self.moved_from)) > STUCK_MOVE: # Stuck = hasn't really moved
+            self.moved_from, self.t_stopped = self.body.copy(), self.now
+        self.move_2D(self.speed, 0.0, self.turn)
+
+    def stop(self):
+        self.speed = self.turn = 0.0
+        self.move_2D(0.0, 0.0, 0.0)
+
+    def avoid(self, heading:float, speed:float):
+        '''Drive along a course-frame heading round static obstacles: in a lane on straight stretches, by the
+        clearest direction while the wanted heading is still swinging round a corner or when no lane fits'''
+        if self.unstick is not None and self.unstick_step(): # Getting unstuck
+            return
+        if self.now - self.t_stopped > STUCK_TIME:
+            if self.lane is not None:
+                self.blocked = (self.lane, heading, self.now + BLOCKED_TIME)
+            self.lane = None
+            target = self.free_heading(heading)
+            if target is not None:
+                self.get_logger().info(f"Stuck: turning on the spot to {target:+.0f} deg, then forward")
+                self.unstick = ("rotate", target, self.now + ROTATE_TIMEOUT)
+            else:
+                self.get_logger().info("Stuck and no clear way to turn to: backing off")
+                self.unstick = ("back", 0.0, self.now + RECOVER_TIME)
+            self.t_stopped = self.now
+            self.unstick_step()
+            return
+        error = self.lane_steer(heading) if abs(wrap_deg(self.heading_cmd - heading)) < 45.0 else None
+        if error is None:
+            error, free = self.steer(self.heading_cmd)
+            speed *= min(1.0, free / LOOKAHEAD + 0.3)
+        self.drive(speed, error)
+
+    def free_heading(self, heading:float):
+        '''Stuck: the heading (course frame, deg) to turn to on the spot so the way ahead is clear, the one nearest the
+        wanted heading. Only headings the body can turn to without sweeping into anything count. None if there is none'''
+        pts = self.pts
+        if len(pts) == 0:
+            return heading
+        thetas = np.radians(np.arange(-90, 91, 5))
+        c, s = np.cos(thetas)[:, None], np.sin(thetas)[:, None]
+        x, y = pts[:, 0] * c + pts[:, 1] * s, -pts[:, 0] * s + pts[:, 1] * c # Returns as seen after turning by theta
+        front = self.body_offset + ROBOT_LENGTH / 2
+        hits = ((x > self.body_offset - ROBOT_LENGTH / 2 - 0.02) & (x < front + 0.02) &
+                (np.abs(y) < ROBOT_WIDTH / 2 + 0.02)).any(axis=1) # Body would touch something at this angle
+        ahead = x - front
+        free = np.where((np.abs(y) < ROBOT_WIDTH / 2 + MIN_MARGIN) & (ahead > -0.03), ahead, 10.0).min(axis=1)
+        zero = len(thetas) // 2
+        reachable = np.zeros(len(thetas), dtype=bool) # Every angle on the way round has to be free too
+        for step in (1, -1):
+            i = zero
+            while 0 <= i < len(thetas) and not hits[i]:
+                reachable[i] = True
+                i += step
+        ok = reachable & (free > UNSTICK_CLEAR)
+        ok[zero] = False # Straight ahead is what got stuck
+        if not ok.any():
+            return None
+        i = int(np.argmin(np.where(ok, np.abs(thetas - self.heading_error(heading)), np.inf)))
+        return wrap_deg(self.cp[2] + math.degrees(thetas[i]))
+
+    def unstick_step(self) -> bool:
+        '''One tick of getting unstuck: turn on the spot to the free heading, then drive forward along it for a moment
+        (or back off straight). Returns False once done, so normal driving takes over again'''
+        mode, target, until = self.unstick
+        if mode == "rotate":
+            error = self.heading_error(target)
+            if abs(error) < math.radians(3.0) or self.now > until:
+                self.unstick = ("forward", target, self.now + UNSTICK_FORWARD_TIME)
+            self.drive(0.0, error)
+        elif mode == "forward":
+            if self.now > until or self.front_free() < STOP_GAP + 0.02:
+                self.unstick = None
+                self.t_stopped = self.now
+                return False
+            self.drive(self.cruise * 0.5, self.heading_error(target))
+        else: # back
+            if self.now > until:
+                self.unstick = None
+                self.t_stopped = self.now
+                return False
+            self.drive(-self.slow, 0.0)
+        self.t_stopped = self.now # Recovery in progress isn't being stuck
+        return True
+
+    def corridor(self, heading:float, next_state:str, front_limit:float, open_side:float, progress:bool):
+        '''Drive along a corridor with obstacle avoidance; turn into the next one once the wall ahead is near and the
+        side it continues on is open'''
+        self.slew_heading(heading)
+        self.avoid(heading, self.cruise)
+        # Where the open side's wall is, as a distance along that side's direction, sampled while going straight
+        side = self.sector(open_side, 12.0, 50)
+        u = np.array((math.cos(math.radians(open_side)), math.sin(math.radians(open_side))))
+        wall = float(self.body @ u) + side
+        opened = side > OPEN_RANGE and len(self.side_walls) >= 5 and wall > np.median(self.side_walls) + OPEN_JUMP
+        if abs(wrap_deg(self.cp[2] - heading)) < 15.0 and side < 2.0 and not opened:
+            self.side_walls.append(wall)
+        # The wall ahead: most of a wide sector, so a static obstacle in front doesn't count
+        if progress and opened and self.sector(heading, 25.0, 70) < front_limit * 1.05:
+            self.set_state(next_state)
+
+    def find_door(self):
+        '''The door in the wall ahead as (wall x, gap middle y, gap width) in the course frame, or None.
+        The wall facing the robot is the x with the most returns; the door is a gap of the right width along it,
+        with returns from beyond the wall showing through'''
+        x, y = self.body
+        ahead = self.cpts[(self.cpts[:, 0] > x + 0.3) & (self.cpts[:, 0] < x + 2.5)]
+        if len(ahead) < 10:
+            return None
+        counts = (np.abs(ahead[:, 0][:, None] - ahead[:, 0][None, :]) < 0.04).sum(axis=1)
+        if counts.max() < 8:
+            return None
+        on_wall = np.abs(ahead[:, 0] - ahead[np.argmax(counts), 0]) < 0.04
+        x_wall = float(np.median(ahead[on_wall, 0]))
+        ys = np.sort(ahead[on_wall, 1])
+        best = None
+        for lo, hi in zip(ys[:-1], ys[1:]):
+            if not DOOR_MIN < hi - lo < DOOR_MAX:
+                continue
+            # Something beyond the wall has to show through the gap, else it's a shadow of something in front
+            b_lo, b_hi = math.atan2(lo - y, x_wall - x), math.atan2(hi - y, x_wall - x)
+            d = self.cpts - self.body
+            bearing = np.arctan2(d[:, 1], d[:, 0])
+            through = self.cpts[(bearing > b_lo) & (bearing < b_hi), 0]
+            if len(through) and np.median(through) < x_wall + 0.2:
+                continue
+            if best is None or abs(hi - lo - 0.4) < abs(best[2] - 0.4):
+                best = (x_wall, (lo + hi) / 2, hi - lo)
+        return best
+
+    def update_door(self, locked:bool=False):
+        '''Average door sightings that agree; start again on one that doesn't (unless locked on)'''
+        seen = self.find_door()
+        if seen is None:
+            return
+        if self.door is not None and abs(seen[0] - self.door[0]) < 0.1 and abs(seen[1] - self.door[1]) < 0.1:
+            self.door = 0.7 * np.array(self.door) + 0.3 * np.array(seen)
+            self.door_hits += 1
+        elif not locked:
+            self.door, self.door_hits = np.array(seen), 1
+
+    def line_up_distance(self) -> float:
+        '''How far in front of the door wall (body centre) to line up: DOOR_LINE_UP, or as much less as it takes for
+        the body, facing the door, to fit clear of everything there'''
+        x_wall, y_gap = self.door[0], self.door[1]
+        P = self.cpts
+        nearest = ROBOT_LENGTH / 2 + 0.08 # Closest it can be and still not touch the door frame
+        for d in np.arange(DOOR_LINE_UP, nearest, -0.02):
+            inside = (np.abs(P[:, 0] - (x_wall - d)) < ROBOT_LENGTH / 2 + 0.04) & (np.abs(P[:, 1] - y_gap) < ROBOT_WIDTH / 2 + 0.04)
+            if not inside.any():
+                return float(d)
+        return nearest
+
+    def new_obstacle(self) -> dict:
+        '''What is known about one moving obstacle: its x, centre-y history, edges, speed, turn-round points, and the
+        lanes the robot holds while waiting for it and crosses it in'''
+        return {"x": None, "t": [], "y": [], "lo": None, "hi": None, "vy": 0.0, "speed": 0.0, "moving": False,
+                "edges": None, "seen": None, "lane": None, "cross_lane": None}
+
+    def update_bounds(self):
+        '''Corridor's bottom and top y past the door, from the returns in a short band beside the robot (clear of the
+        door wall behind and the moving obstacles ahead)'''
+        P = self.cpts
+        band = P[(P[:, 0] > self.body[0] - 0.05) & (P[:, 0] < self.body[0] + 0.25)]
+        above, below = band[band[:, 1] > self.body[1] + 0.1, 1], band[band[:, 1] < self.body[1] - 0.1, 1]
+        if len(above) < 3 or len(below) < 3:
+            return
+        top, bottom = float(np.median(above[above < above.min() + 0.05])), float(np.median(below[below > below.max() - 0.05]))
+        if not 0.8 < top - bottom < 3.0:
+            return
+        self.bounds = (bottom, top) if self.bounds is None else \
+            (0.8 * self.bounds[0] + 0.2 * bottom, 0.8 * self.bounds[1] + 0.2 * top)
+
+    def track_obstacle(self):
+        '''Find the next moving obstacle in the scan: a short (<= 0.45 m) cluster of returns across the corridor ahead.
+        Records its edges and centre history, estimates its sideways speed and learns where it turns round'''
+        o = self.obstacles[self.k]
+        bottom, top = self.bounds
+        P = self.cpts
+        P = P[(P[:, 0] > self.body[0]) & (P[:, 0] < self.body[0] + 2.0) & (P[:, 1] > bottom + 0.05) & (P[:, 1] < top - 0.05)]
+        P = P[np.argsort(P[:, 0])]
+        clusters, start = [], 0
+        for i in range(1, len(P) + 1):
+            if i == len(P) or P[i, 0] - P[start, 0] > 0.08:
+                c = P[start:i]
+                if len(c) >= 3 and np.ptp(c[:, 1]) <= 0.45:
+                    clusters.append(c)
+                start = i
+        if o["x"] is not None:
+            clusters = [c for c in clusters if abs(np.median(c[:, 0]) - o["x"]) < 0.15]
+        elif self.k > 0 and self.obstacles[0]["x"] is not None:
+            clusters = [c for c in clusters if np.median(c[:, 0]) > self.obstacles[0]["x"] + 0.3]
+        if not clusters:
+            return
+        c = clusters[0] # Nearest
+        x_c = float(np.median(c[:, 0]))
+        o["x"] = x_c if o["x"] is None else 0.8 * o["x"] + 0.2 * x_c
+        lo_edge, hi_edge = float(c[:, 1].min()), float(c[:, 1].max())
+        centre = (lo_edge + hi_edge) / 2
+        if hi_edge - lo_edge < 2 * OBSTACLE_HALF - 0.04: # Partly hidden against a wall: go by the edge still in view
+            if lo_edge < bottom + 0.1:
+                centre = hi_edge - OBSTACLE_HALF
+            elif hi_edge > top - 0.1:
+                centre = lo_edge + OBSTACLE_HALF
+        o["edges"] = (min(lo_edge, centre - OBSTACLE_HALF), max(hi_edge, centre + OBSTACLE_HALF))
+        o["seen"] = self.now
+        o["t"].append(self.now)
+        o["y"].append(centre)
+        while o["t"][0] < self.now - 3.0:
+            o["t"].pop(0); o["y"].pop(0)
+        t, y = np.array(o["t"]), np.array(o["y"])
+        recent = t > self.now - 0.6
+        if recent.sum() >= 4 and np.ptp(t[recent]) > 0.25:
+            vy = float(np.polyfit(t[recent], y[recent], 1)[0])
+            if o["moving"] and vy * o["vy"] < 0 and abs(o["vy"]) > 0.08: # Turned round: that's an end of its travel
+                o["lo" if o["vy"] < 0 else "hi"] = float(y[recent].min() if o["vy"] < 0 else y[recent].max())
+            o["vy"], o["moving"] = vy, abs(vy) > 0.05
+            o["speed"] = max(o["speed"], abs(vy)) # It moves at a constant speed: slower fits straddle a turn-round
+
+    def is_static(self) -> bool:
+        '''In view for STATIC_WINDOW and moved less than STATIC_MOVE in that time: a static obstacle, don't wait for it'''
+        o = self.obstacles[self.k]
+        t, y = np.array(o["t"]), np.array(o["y"])
+        if len(t) < 5 or t[-1] - t[0] < STATIC_WINDOW:
+            return False
+        window = t > self.now - STATIC_WINDOW
+        return float(np.ptp(y[window])) < STATIC_MOVE
+
+    def crossing_lane(self) -> float:
+        '''y to cross at. Stage 2 (DIRECTION_DODGE): shift towards the side the obstacle is leaving'''
+        o = self.obstacles[self.k]
+        y = float(self.body[1])
+        if DIRECTION_DODGE and o["moving"]:
+            bottom, top = self.bounds
+            y -= math.copysign(DODGE_SHIFT, o["vy"])
+            y = float(np.clip(y, bottom + ROBOT_WIDTH / 2 + 0.1, top - ROBOT_WIDTH / 2 - 0.1))
+        return y
+
+    def crossing_safe(self, lane:float, margin:float=OBSTACLE_MARGIN) -> bool:
+        '''Simulate crossing from here, at cross speed, drifting to lane, against the obstacle bouncing between its
+        ends: safe if the body never overlaps its path while the obstacle is there (plus margin)'''
+        o = self.obstacles[self.k]
+        if o["x"] is None or o["edges"] is None or len(o["t"]) < 4 or o["t"][-1] - o["t"][0] < MIN_TRACK:
+            return False
+        bottom, top = self.bounds
+        half = max(OBSTACLE_HALF, (o["edges"][1] - o["edges"][0]) / 2)
+        lo = o["lo"] if o["lo"] is not None else bottom + half
+        hi = o["hi"] if o["hi"] is not None else top - half
+        # A body slanted towards the lane reaches further along and across than a straight one
+        tilt = max(math.atan2(abs(lane - self.body[1]), CROSS_CARROT), math.radians(abs(self.cp[2])))
+        half_x = ROBOT_LENGTH / 2 * math.cos(tilt) + ROBOT_WIDTH / 2 * math.sin(tilt)
+        half_y = ROBOT_WIDTH / 2 * math.cos(tilt) + ROBOT_LENGTH / 2 * math.sin(tilt)
+        t = np.arange(0.0, 5.0, DT)
+        v = np.minimum(self.cross_speed, max(self.speed, 0.0) + self.accel * t)
+        free, x, travelled = self.front_free(self.obstacle_mask()), np.empty(len(t)), 0.0
+        for i in range(len(t)): # Braking for whatever is beyond (the end wall) slows the crossing down
+            v[i] = min(v[i], max(0.0, CROSS_BRAKE * (free - travelled - STOP_GAP)))
+            travelled += v[i] * DT
+            x[i] = self.body[0] + travelled
+        rear_done = x - half_x > o["x"] + OBSTACLE_THICK + 0.03
+        if not rear_done.any():
+            return False
+        progress = np.clip((x - self.body[0]) / max(0.3, o["x"] - self.body[0]), 0.0, 1.0)
+        y_robot = self.body[1] + (lane - self.body[1]) * progress
+        vy = math.copysign(max(abs(o["vy"]), o["speed"]), o["vy"]) if o["moving"] else 0.0
+        y_obstacle = bounce(np.mean(o["edges"]), vy, t, lo, hi)
+        in_path = (x + half_x > o["x"] - OBSTACLE_THICK - margin) & (x - half_x < o["x"] + OBSTACLE_THICK + margin)
+        overlap = np.abs(y_robot - y_obstacle) < half + half_y + margin + 0.1 * abs(o["vy"])
+        until = int(np.argmax(rear_done)) + 1
+        return not (in_path[:until] & overlap[:until]).any()
+
+    def obstacle_mask(self) -> np.ndarray:
+        '''Returns on the current moving obstacle's path, so the front stop doesn't brake for it mid-crossing'''
+        o = self.obstacles[self.k]
+        if o["x"] is None:
+            return None
+        return np.abs(self.cpts[:, 0] - o["x"]) < 0.08
+
+    def wait_x(self) -> float:
+        '''Body-centre x to wait at in front of the next moving obstacle'''
+        return self.obstacles[self.k]["x"] - OBSTACLE_THICK - WAIT_GAP - ROBOT_LENGTH / 2
+
+    def passed_obstacle(self) -> bool:
+        '''Body's rear past the obstacle (one never seen is taken to be 0.6 m after the previous one, or the door)'''
+        o = self.obstacles[self.k]
+        x_o = o["x"] if o["x"] is not None else (self.obstacles[0]["x"] if self.k else self.door[0]) + 0.6
+        return self.rear_x > x_o + OBSTACLE_THICK + (0.12 if self.k == len(self.obstacles) - 1 else 0.06)
+
+    def cross(self, lane:float):
+        self.obstacles[self.k]["cross_lane"] = lane
+        self.set_state("OBSTACLE_CROSS")
+
+    def next_obstacle(self):
+        self.k += 1
+        if self.k >= len(self.obstacles):
+            self.stop()
+            self.set_state("DONE")
+            self.get_logger().info(f"SUCCESS: passed both moving obstacles in {self.now - self.t_start:.1f} s")
+        else:
+            self.set_state("OBSTACLE_WAIT")
+
     def timer_callback(self):
         """Controller loop. Insert path planning and PID control logic here"""
         if self.pose is None:
@@ -292,344 +704,133 @@ class ObstacleCourseNode(Node):
             return # Calibration mode: look, don't drive
 
         ###### INSERT CODE HERE ######
-        if self.course_map is None:
-            return # no scan has been added to the map yet
-        if self.state == EXPLORE:
-            self.explore()
-        elif self.state == HOLD:
-            self.hold()
-        else:
-            self.cross()
+        if not hasattr(self, "last_scan"):
+            return # Waits for the first LiDAR scan
+        if not hasattr(self, "state"):
+            self.setup_run()
+        self.sense()
+        state = self.state
+
+        # Section 1: zig-zag corridor with static obstacles. Avoidance steers round them; corners are smooth arcs
+        if state == "CORRIDOR_EAST":
+            self.corridor(0.0, "CORRIDOR_SOUTH", CORNER_EAST_FRONT, -90.0, progress=self.body[0] > 0.9)
+        elif state == "CORRIDOR_SOUTH":
+            self.corridor(-90.0, "TO_DOOR", CORNER_SOUTH_FRONT, 0.0, progress=self.body[1] < -1.4)
+
+        # Section 2: small door. Find the gap in the wall ahead, line up on it, drive straight through
+        elif state == "TO_DOOR":
+            self.slew_heading(0.0)
+            if self.new_scan:
+                self.update_door()
+            self.avoid(0.0, self.cruise * 0.6)
+            if self.door is not None and self.door_hits >= 3:
+                self.set_state("DOOR_LINE_UP" if self.door[0] - self.front_x > DOOR_STANDOFF + 0.1 else "DOOR_RETRY")
+        elif state == "DOOR_LINE_UP": # Smooth arc to a point straight in front of the door
+            x_wall, y_gap = self.door[0], self.door[1]
+            if self.new_scan and x_wall - self.front_x > 0.5:
+                self.update_door(locked=True)
+            if self.new_scan: # Something standing on the line-up point: line up closer to the door instead
+                self.line_up = min(self.line_up, self.line_up_distance())
+            # The robot turns about its pose, so the pose goes to the point that puts the body centre on the door's line
+            dx, dy = x_wall - self.line_up - self.body_offset - self.cp[0], y_gap - self.cp[1]
+            distance = math.hypot(dx, dy)
+            if distance < 0.04:
+                self.set_state("DOOR_ALIGN")
+            elif x_wall - self.front_x < self.line_up - ROBOT_LENGTH / 2 - 0.05 or self.now - self.t_stopped > STUCK_TIME:
+                self.get_logger().info("Can't reach the line-up point: backing off to try again")
+                self.set_state("DOOR_RETRY") # Overshot it towards the door wall, or blocked on the way
+            else:
+                bearing = math.degrees(math.atan2(dy, dx))
+                if distance > 0.4: # Far: smooth arcs round anything that isn't the door wall
+                    direction, free = self.steer(bearing, ignore=self.cpts[:, 0] > x_wall - 0.1)
+                else:
+                    direction = self.heading_error(bearing)
+                if abs(direction) > math.radians(LINE_UP_PIVOT): # Point well off to the side: face it first, then drive
+                    self.drive(0.0, direction)
+                    self.t_stopped = self.now # Turning on the spot isn't being stuck
+                else:
+                    self.drive(min(self.cruise * 0.6, max(0.03, 1.2 * distance)), direction)
+        elif state == "DOOR_ALIGN": # Turn on the spot to face through the door
+            self.drive(0.0, self.heading_error(0.0))
+            if abs(self.cp[2]) < 2.0 and abs(self.turn) < 0.1:
+                aligned = abs(self.door[1] - self.body[1]) < DOOR_TOL
+                self.set_state("DOOR_PASS" if aligned else "DOOR_RETRY")
+        elif state == "DOOR_PASS":
+            x_wall, y_gap = self.door[0], self.door[1]
+            self.drive(self.slow, self.heading_error(math.degrees(math.atan2(y_gap - self.body[1], DOOR_CARROT))))
+            if self.rear_x > x_wall + 0.05:
+                self.set_state("OBSTACLE_WAIT")
+            elif self.now - self.t_stopped > 2.0: # Stuck on the door frame
+                self.set_state("DOOR_RETRY")
+        elif state == "DOOR_RETRY": # Back off straight, then line up again
+            self.drive(-self.slow, self.heading_error(0.0))
+            if self.body[0] < self.door[0] - self.line_up - 0.3 or self.now - self.t_stopped > 2.0:
+                self.set_state("DOOR_LINE_UP")
+
+        # Section 3: moving obstacles, one at a time. Wait in front of each and cross when the simulated crossing is
+        # clear; something that doesn't move (or a wait that is too long) is gone round instead
+        elif state in ("OBSTACLE_WAIT", "OBSTACLE_CROSS", "OBSTACLE_AVOID"):
+            if self.new_scan:
+                self.update_bounds()
+                if self.bounds is not None:
+                    self.track_obstacle()
+            if self.bounds is None and self.now - self.t_state > 1.0: # Can't measure it: assume a 1.6 m corridor
+                self.bounds = (float(self.body[1]) - 0.8, float(self.body[1]) + 0.8)
+                self.get_logger().info("Corridor width not measured: assuming 1.6 m")
+            if self.bounds is None:
+                self.stop()
+                return
+            o = self.obstacles[self.k]
+            if state == "OBSTACLE_WAIT": # Drive to the waiting point in front of it (holding the lane), cross when clear
+                if o["lane"] is None:
+                    o["lane"] = float(self.body[1])
+                hold = self.heading_error(math.degrees(math.atan2(o["lane"] - self.body[1], CROSS_CARROT)))
+                to_wait = self.slow if o["x"] is None else 2.0 * (self.wait_x() - self.body[0])
+                self.drive(float(np.clip(to_wait, -self.slow, self.cruise)), hold)
+                lane = self.crossing_lane()
+                if self.now - (o["seen"] or self.t_state) > LOST_TIMEOUT:
+                    self.get_logger().info(f"Obstacle {self.k + 1} not in sight: crossing")
+                    self.cross(float(self.body[1]))
+                elif self.is_static():
+                    self.get_logger().info(f"Obstacle {self.k + 1} has not moved for {STATIC_WINDOW} s: static, going round it")
+                    self.set_state("OBSTACLE_AVOID")
+                elif self.now - self.t_state > WAIT_TIMEOUT:
+                    self.get_logger().info(f"Waited {WAIT_TIMEOUT} s for obstacle {self.k + 1}: going round it")
+                    self.set_state("OBSTACLE_AVOID")
+                elif o["moving"] and self.crossing_safe(lane):
+                    side = "none" if lane == float(self.body[1]) else ("left" if lane > self.body[1] else "right")
+                    self.get_logger().info(f"Obstacle {self.k + 1} moving {'left' if o['vy'] > 0 else 'right'} "
+                                           f"({o['vy']:+.2f} m/s): crossing, shift {side}")
+                    self.cross(lane)
+            elif state == "OBSTACLE_CROSS":
+                heading = math.degrees(math.atan2(o["cross_lane"] - self.body[1], CROSS_CARROT))
+                self.drive(self.cross_speed, self.heading_error(heading), ignore=self.obstacle_mask(), brake=CROSS_BRAKE)
+                if self.passed_obstacle():
+                    if self.k + 1 < len(self.obstacles):
+                        self.obstacles[self.k + 1]["lane"] = o["cross_lane"]
+                    self.next_obstacle()
+                elif o["x"] is not None and self.front_x < o["x"] - OBSTACLE_THICK - 0.02 \
+                        and not self.crossing_safe(o["cross_lane"], margin=OBSTACLE_MARGIN / 2): # Hysteresis
+                    self.get_logger().info("Obstacle coming back before the robot is in its path: wait again")
+                    self.set_state("OBSTACLE_WAIT")
+            else: # OBSTACLE_AVOID
+                self.heading_cmd = 0.0
+                self.avoid(0.0, self.slow)
+                if self.passed_obstacle():
+                    self.next_obstacle()
+
+        elif state == "DONE":
+            self.stop()
+
+        if self.now - self.t_log > 1.0:
+            self.t_log = self.now
+            o = self.obstacles[min(self.k, 1)]
+            door = "" if self.door is None else f" door x={self.door[0]:.2f} y={self.door[1]:.2f} w={self.door[2]:.2f}"
+            obs = "" if o["x"] is None else f" obstacle{min(self.k, 1) + 1} x={o['x']:.2f} vy={o['vy']:+.2f}"
+            self.get_logger().info(f"{self.state:17s} pose ({self.cp[0]:+.2f}, {self.cp[1]:+.2f}, {self.cp[2]:+6.1f})"
+                                   f" v={self.speed:.2f}{door}{obs}")
         ###### INSERT CODE HERE ######
-
-    def explore(self):
-        '''Follow the path to the target, replanning every REPLAN_PERIOD. Hold when it leads past a moving obstacle'''
-        self.replan_if_due()
-        if self.path is None:
-            self.drive(0.0, 0.0) # nothing left to explore: stay, keep mapping and replanning
-            return
-        path = self.path_ahead()
-        if self.find_crossing(path) is None:
-            self.follow(path)
-            return
-        self.state = HOLD
-        self.was_blocked, self.clear_since, self.windows = False, None, []
-        self.get_logger().info(f"{self.state}: moving obstacle ahead")
-
-    def hold(self):
-        '''Approach a moving obstacle's sweep zone and face it. Meanwhile, time how long the crossing stays clear each
-        time the obstacle leaves it, and cross at the start of a window that should be long enough.
-        Everything is recomputed every tick, because the sweep zone grows while the robot watches'''
-        self.replan_if_due()
-        path = None if self.path is None else self.path_ahead()
-        crossing = None if path is None else self.find_crossing(path)
-        if crossing is None:
-            self.state = EXPLORE
-            self.get_logger().info(f"{self.state}: no moving obstacle ahead any more")
-            return
-        start, end = crossing
-        out = min(end + int(np.ceil(ARRIVE_TOL / CourseMap.CELL_SIZE)), len(path) - 1) # ARRIVE_TOL past the zone's reach
-        if start == 0: # already within reach, because the zone grew around the robot: leave by the shortest route
-            cost, blocked, reach = self.course_map.planning_grids()
-            outside = ~dilate(reach, disk(ARRIVE_TOL, CourseMap.CELL_SIZE)) & ~blocked # ARRIVE_TOL clear of reach
-            cells = plan_path(cost, self.course_map.to_cell(self.pose[:2]), outside)
-            if cells is not None:
-                self.cross_path = self.course_map.cells_to_world(np.array(cells))
-                self.state = CROSS
-                self.get_logger().info(f"{self.state}: within reach of a moving obstacle, leaving")
-            return
-
-        blocked = self.crossing_blocked(path[start:end])
-        window_started = self.was_blocked and not blocked
-        if blocked != self.was_blocked:
-            now = self.get_clock().now().nanoseconds * 1e-9
-            if blocked and self.clear_since is not None:
-                self.windows.append(now - self.clear_since) # a clear window just ended
-            if not blocked:
-                self.clear_since = now
-            self.was_blocked = blocked
-
-        if not self.follow(path[:start]):
-            return # still driving to the hold point, just outside the zone's reach
-        _, alpha = self.carrot(path)
-        if abs(alpha) > ALIGN_TOL:
-            self.turn_in_place(alpha)
-            return
-        self.drive(0.0, 0.0)
-
-        # The obstacle repeats its motion, so the window one cycle ago, two windows back, shows how long the one
-        # starting now will last. Near one end of the obstacle's path, windows alternate long and short
-        crossing_length = np.sum(np.linalg.norm(np.diff(path[start - 1:out + 1], axis=0), axis=1))
-        cross_time = crossing_length / MAX_SPEED + MAX_SPEED / (2 * MAX_ACCEL) # + time lost ramping up
-        if window_started and len(self.windows) >= 2 and self.windows[-2] >= cross_time:
-            self.cross_path = path[:out + 1]
-            self.state = CROSS
-            self.get_logger().info(f"{self.state}: expecting {self.windows[-2]:.1f} s clear, need {cross_time:.1f} s")
-
-    def cross(self):
-        '''Drive through the crossing, or out of reach, without stopping. Then go back to exploring'''
-        if self.follow(self.cross_path, safety=False, reverse=True):
-            self.state = EXPLORE
-            self.plan_time = -math.inf # replan at once
-            self.get_logger().info(f"{self.state}: crossed")
-
-    def replan_if_due(self):
-        '''Replan if REPLAN_PERIOD has passed since the last plan'''
-        now = self.get_clock().now().nanoseconds * 1e-9
-        if now - self.plan_time >= REPLAN_PERIOD:
-            self.plan_time = now
-            self.replan()
-
-    def path_ahead(self) -> np.ndarray:
-        '''The current path from the point closest to the robot'''
-        return self.path[np.argmin(np.linalg.norm(self.path - self.pose[:2], axis=1)):]
-
-    def replan(self):
-        '''Plan to the current target if it is still worth reaching, otherwise to the nearest frontier.
-        With no frontier left, head for the end of the course: the reachable cell farthest from the start.
-        Sets self.path (world points) and self.target, both None if nothing can be reached'''
-        cost, blocked, reach = self.course_map.planning_grids()
-        allowed = self.course_map.ahead(self.start) & ~blocked & ~reach # where a target may be
-        frontier = self.course_map.frontier(allowed)
-        start = self.course_map.to_cell(self.pose[:2])
-        cells = None
-        if self.target is not None:
-            goal = self.course_map.to_cell(self.target)
-            if frontier[goal] or (self.to_end and not frontier.any()):
-                cells = plan_to(cost, start, goal)
-        if cells is None:
-            cells = plan_path(cost, start, frontier) if frontier.any() else None
-            self.to_end = False
-        if cells is None:
-            _, _, g = search(cost, self.course_map.to_cell(self.start[:2]))
-            candidates = ((self.course_map.occupancy_map < CourseMap.FREE) & allowed).tolist()
-            end = max((cell for cell in g if candidates[cell[0]][cell[1]]), key=g.get, default=None)
-            cells = None if end is None else plan_to(cost, start, end)
-            self.to_end = True
-        self.path = None if cells is None else self.course_map.cells_to_world(np.array(cells))
-        self.target = None if cells is None else self.path[-1]
-        self.get_logger().debug(f"Planned in {self.get_clock().now().nanoseconds * 1e-9 - self.plan_time:.2f} s")
-
-    def find_crossing(self, path:np.ndarray):
-        '''(start, end) indices of the first stretch of path within SWEEP_CLEARANCE of the sweep zone, or None'''
-        near = self.course_map.distances(self.course_map.dynamic_map >= 0, path) < SWEEP_CLEARANCE
-        if not near.any():
-            return None
-        start = int(np.argmax(near))
-        clear = np.flatnonzero(~near[start:])
-        return start, (start + int(clear[0]) if len(clear) else len(path))
-
-    def crossing_blocked(self, crossing:np.ndarray) -> bool:
-        '''True if the latest scan saw a moving obstacle within SWEEP_CLEARANCE of the crossing (world points)'''
-        moving_now = self.course_map.dynamic_map == self.scan_count
-        return bool(np.any(self.course_map.distances(moving_now, crossing) < SWEEP_CLEARANCE))
-
-    def carrot(self, path:np.ndarray) -> tuple:
-        '''Remaining path length from the robot, and the angle (rad) from its heading to the carrot:
-        the first path point at least LOOKAHEAD away, after the point closest to the robot'''
-        distances = np.linalg.norm(path - self.pose[:2], axis=1)
-        i = int(np.argmin(distances))
-        remaining = distances[i] + np.sum(np.linalg.norm(np.diff(path[i:], axis=0), axis=1))
-        far = np.flatnonzero(distances[i:] >= LOOKAHEAD)
-        dx, dy = (path[i + far[0]] if len(far) else path[-1]) - self.pose[:2]
-        return remaining, math.radians(wrap_deg(math.degrees(math.atan2(dy, dx)) - self.pose[2]))
-
-    def follow(self, path:np.ndarray, safety:bool=True, reverse:bool=False) -> bool:
-        '''Drive along path with pure pursuit. Returns True once the robot has reached the end.
-        With reverse, back up instead of turning round when the carrot is behind the robot'''
-        remaining, alpha = self.carrot(path)
-        if remaining < ARRIVE_TOL:
-            self.drive(0.0, 0.0)
-            return True
-        if reverse and abs(alpha) > math.pi / 2:
-            backward = math.atan2(math.sin(alpha + math.pi), math.cos(alpha + math.pi)) # the carrot's angle from the rear
-            self.drive(-MAX_SPEED * math.cos(backward), 2 * MAX_SPEED * math.cos(backward) * math.sin(backward) / LOOKAHEAD)
-            return False
-        if abs(alpha) > TURN_IN_PLACE:
-            self.turn_in_place(alpha)
-            return False
-        if safety and self.blocked_ahead():
-            self.drive(0.0, 0.0) # wait for the map and the next plan to route around it
-            return False
-        speed = MAX_SPEED * math.cos(alpha)
-        turn = 2 * speed * math.sin(alpha) / LOOKAHEAD # turn rate along the arc through the carrot
-        if abs(turn) < MIN_TURN:
-            turn = 0.0 if abs(alpha) < ALIGN_TOL else math.copysign(MIN_TURN, alpha)
-        self.drive(speed, turn)
-        return False
-
-    def turn_in_place(self, alpha:float):
-        '''Turn on the spot towards a heading error of alpha (rad)'''
-        self.drive(0.0, math.copysign(np.clip(TURN_GAIN * abs(alpha), MIN_TURN, MAX_TURN), alpha))
-
-    def drive(self, speed:float, turn:float):
-        '''Send a forward speed (m/s) and turn rate (rad/s). Forward speed ramps up by at most MAX_ACCEL, but drops at once'''
-        self.speed = min(speed, max(self.speed, 0.0) + MAX_ACCEL * DT)
-        self.turning = speed == 0.0 and turn != 0.0
-        self.move_2D(self.speed, 0.0, turn)
-
-    def blocked_ahead(self) -> bool:
-        '''True if a LiDAR return is within STOP_DISTANCE in front of the robot's front edge'''
-        ranges = np.nan_to_num(np.array(self.scan.ranges), posinf=0.0) # no return -> 0, which never counts
-        angles = self.scan.angle_min + np.arange(len(ranges)) * self.scan.angle_increment
-        x, y = ranges * np.cos(angles), ranges * np.sin(angles)
-        ahead = (x > ROBOT_LENGTH / 2) & (x < ROBOT_LENGTH / 2 + STOP_DISTANCE) # beside the body, stopping can't help
-        return bool(np.any(ahead & (np.abs(y) < ROBOT_WIDTH / 2)))
-
-class CourseMap:
-    '''Two grids over the same cells, in the same frame as self.pose, that grow as the robot sees more.
-    occupancy_map holds walls and static obstacles as log-odds. dynamic_map holds, for each cell,
-    the number of the last scan that saw a moving obstacle there (-1 = never)'''
-    CELL_SIZE = 0.025 # 2.5 cm square cell
-    GROW_MARGIN = 1.0 # 1m of unknown space added when map grows
-
-    L_OCC = 0.85
-    L_FREE = -0.4
-    L_MIN, L_MAX = -4.0, 4.0
-
-    OCCUPIED = 1.0
-    FREE = -1.0
-    CONFIDENT_FREE = -2.0 # a hit is a moving obstacle if its cell and all 8 neighbours are below this
-
-    def __init__(self, start_x, start_y):
-        """
-           y
-        4.0 ┌──────┬──────┬──────┬──────┐
-            │[2,0] │[2,1] │[2,2] │[2,3] │   row 2
-        3.0 ├──────┼──────┼──────┼──────┤
-            │[1,0] │[1,1] │[1,2] │[1,3] │   row 1
-        2.0 ├──────┼──────┼──────┼──────┤
-            │[0,0] │[0,1] │[0,2] │[0,3] │   row 0
-        1.0 └──────┴──────┴──────┴──────┘
-            2.0    3.0    4.0    5.0    6.0  x
-            col 0  col 1  col 2  col 3
-        """
-        self.occupancy_map = np.zeros((1, 1))
-        self.dynamic_map = np.full((1, 1), -1)
-        self.origin = np.array((start_x, start_y))
-
-    def to_cells(self, xy: np.ndarray) -> np.ndarray:
-        """
-        World coordinate to cell coordiate.
-        NOTE: since input is x, y this fn returns (col, row) that u need to flip when indexing
-        """
-        return np.floor((xy - self.origin) / self.CELL_SIZE).astype(int)
-
-    def to_cell(self, xy:np.ndarray) -> tuple:
-        '''One world point -> its cell as (row, col), ready for indexing'''
-        col, row = self.to_cells(xy[None, :])[0]
-        return int(row), int(col)
-
-    def cells_to_world(self, cells:np.ndarray) -> np.ndarray:
-        '''Cells (N, 2) as (row, col) -> world positions (N, 2) of their centres'''
-        return self.origin + (cells[:, ::-1] + 0.5) * self.CELL_SIZE
-
-    def to_flat_cells(self, xy:np.ndarray) -> np.ndarray:
-        """
-        returns idx of cell if matrix is flattened
-        """
-
-        cells = self.to_cells(xy)
-
-        return np.unique(cells[:, 1] * self.occupancy_map.shape[1] + cells[:, 0])
-
-    def grow_map_to_fit(self, xy: np.ndarray):
-        cells = self.to_cells(xy)
-        rows, cols = self.occupancy_map.shape
-
-        # Keep a border of one cell, so every hit has all 8 neighbours inside the map
-        below = np.maximum(1 - cells.min(axis = 0), 0) # cells needed before col 1, row 1
-        above = np.maximum(cells.max(axis=0) - (cols - 2, rows - 2), 0) # cells needed after the second-last col, row
-
-        if not (below.any() or above.any()):
-            # no need to grow map
-            return
-
-        margin = int(self.GROW_MARGIN / self.CELL_SIZE)
-
-        before = np.where(below > 0, below + margin, 0)
-        after = np.where(above > 0, above + margin, 0)
-
-        pad = ((before[1], after[1]), (before[0], after[0]))
-        self.occupancy_map = np.pad(self.occupancy_map, pad)
-        self.dynamic_map = np.pad(self.dynamic_map, pad, constant_values=-1)
-
-        self.origin = self.origin - before * self.CELL_SIZE
-
-    def update(self, lidar_xy: np.ndarray, angles: np.ndarray, ranges: np.ndarray, max_range: float, scan_number: int):
-        valid = np.isfinite(ranges)
-        angles, ranges = angles[valid], ranges[valid]
-
-        is_hit = ranges <= max_range
-        ranges = np.minimum(ranges, max_range)
-        directions = np.stack((np.cos(angles), np.sin(angles)), axis = 1)
-        ends = lidar_xy + ranges[:, None] * directions
-
-        self.grow_map_to_fit(np.vstack((lidar_xy, ends)))
-
-        steps = np.arange(0.0, max_range, self.CELL_SIZE / 2)
-        before_end = steps[None, :] < ranges[:, None] - self.CELL_SIZE
-
-        samples = lidar_xy + steps[None, :, None] * directions[:, None, :]
-        free = self.to_flat_cells(samples[before_end])
-        hits = self.to_flat_cells(ends[is_hit])
-
-        grid = self.occupancy_map.reshape(-1)
-        # Beams can't pass through anything static, so a hit where beams keep passing is a moving obstacle.
-        # Checking the 8 neighbours too stops noisy hits just in front of a wall from counting
-        cols = self.occupancy_map.shape[1]
-        neighbourhood = (np.arange(-1, 2)[:, None] * cols + np.arange(-1, 2)).ravel()
-        dynamic = np.all(grid[hits[:, None] + neighbourhood] < self.CONFIDENT_FREE, axis=1)
-
-        grid[free] += self.L_FREE
-        grid[hits[~dynamic]] += self.L_OCC
-
-        np.clip(grid, self.L_MIN, self.L_MAX, out = grid)
-        self.dynamic_map.reshape(-1)[hits[dynamic]] = scan_number
-
-    def planning_grids(self) -> tuple:
-        '''Returns (cost, blocked, reach), all the same shape as occupancy_map.
-        blocked: within half the robot's width of an occupied cell, so the robot's centre shouldn't go there.
-        reach: within SWEEP_CLEARANCE of the sweep zone, where a moving obstacle can touch the robot.
-        cost: cost of entering each cell. inf if occupied, INFLATED if blocked, otherwise higher the closer it is to a wall'''
-        occupied = self.occupancy_map > self.OCCUPIED
-        blocked = dilate(occupied, disk(ROBOT_WIDTH / 2, self.CELL_SIZE))
-
-        # Clearance: how many cells to the nearest blocked cell, counted up to the robot's width
-        clear_max = int(np.ceil(ROBOT_WIDTH / self.CELL_SIZE))
-        clearance = np.full(blocked.shape, clear_max)
-        near = blocked
-        for distance in range(clear_max):
-            clearance[near & (clearance == clear_max)] = distance
-            near = dilate(near, EIGHT_NEIGHBOURS)
-
-        cost = 1.0 + CLEARANCE_WEIGHT * (clear_max - clearance) / clear_max
-        cost[blocked] = INFLATED
-        cost[occupied] = np.inf
-        reach = dilate(self.dynamic_map >= 0, disk(SWEEP_CLEARANCE, self.CELL_SIZE))
-        return cost, blocked, reach
-
-    def ahead(self, pose:np.ndarray) -> np.ndarray:
-        '''True for cells ahead of the line through pose's position at right angles to its heading'''
-        rows, cols = self.occupancy_map.shape
-        x = self.origin[0] + (np.arange(cols) + 0.5) * self.CELL_SIZE
-        y = self.origin[1] + (np.arange(rows) + 0.5) * self.CELL_SIZE
-        heading = np.deg2rad(pose[2])
-        return (x[None, :] - pose[0]) * np.cos(heading) + (y[:, None] - pose[1]) * np.sin(heading) > 0
-
-    def frontier(self, allowed:np.ndarray) -> np.ndarray:
-        '''Free cells next to an unknown cell, inside allowed'''
-        log_odds = self.occupancy_map
-        unknown = (log_odds >= self.FREE) & (log_odds <= self.OCCUPIED)
-        return (log_odds < self.FREE) & dilate(unknown, EIGHT_NEIGHBOURS) & allowed
-
-    def distances(self, mask:np.ndarray, points:np.ndarray) -> np.ndarray:
-        '''Distance from each world point (N, 2) to the centre of the nearest True cell of mask. inf if there are none'''
-        if not mask.any():
-            return np.full(len(points), np.inf)
-        centres = self.cells_to_world(np.argwhere(mask))
-        return np.min(np.linalg.norm(points[:, None] - centres[None], axis=2), axis=1)
-
+                
 
 def main(args=None):
     arg_parser = argparse.ArgumentParser(description="RB2301 final project")
