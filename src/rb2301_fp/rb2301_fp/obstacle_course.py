@@ -1,9 +1,7 @@
 import argparse
 import configparser
-import heapq
 import math
 import os
-from collections import deque
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -23,10 +21,6 @@ _PACKAGE_DIR = os.path.dirname(os.path.realpath(__file__))
 def wrap_deg(angle:float) -> float:
     '''Wrap an angle in degrees into [-180, 180).'''
     return (angle + 180.0) % 360.0 - 180.0
-
-def stamp_seconds(stamp) -> float:
-    '''A message header's stamp in seconds'''
-    return stamp.sec + stamp.nanosec * 1e-9
 
 def optitrack_to_maze(x:float, y:float, heading_deg:float, frame:dict) -> tuple:
     '''Optitrack-frame pose (x, y, heading in degrees) -> CA2 maze-frame pose (see optitrack_variables.config).'''
@@ -58,128 +52,32 @@ def load_frame(robot_number:int) -> tuple:
     course = {k: parser.getfloat("course", k, fallback=0.0) for k in ("origin_x", "origin_y", "rotation_deg")}
     return frame, course
 
-# Robot size, from CA1
-ROBOT_WIDTH = 0.225 # m
-ROBOT_LENGTH = 0.289 # m
-# m. Extra distance for pose, LiDAR and steering errors on the real robot. WALL_MARGIN is kept from walls and static
-# obstacles wherever there's room (section 5.3 of PLAN.md). SAFETY_MARGIN is always kept from moving obstacles
-WALL_MARGIN = 0.15
-SAFETY_MARGIN = 0.05
-# m. Any closer to a moving obstacle and the robot can touch it, whatever its heading: half the robot's diagonal, plus a
-# cell's diagonal, because the hits and the path are both cell centres, each up to half a cell's diagonal off
-SWEEP_CLEARANCE = math.hypot(ROBOT_WIDTH, ROBOT_LENGTH) / 2 + math.sqrt(2) * 0.025 + SAFETY_MARGIN
 
-# LiDAR mounting: how far ahead of the robot's centre it is (m), and the angle from the robot's heading to the LiDAR's
-# angle 0 (rad). Gazebo's comes from the URDF (laser_joint): it faces backwards, so its angle 0 points behind the robot.
-# The real robot's has to be measured: run ./fp.sh --calibrate with a box in front of the robot (PLAN.md section 10)
-SIM_LIDAR_X, SIM_LIDAR_YAW = 0.114, math.pi
-REAL_LIDAR_X, REAL_LIDAR_YAW = 0.040, math.pi
-# How far the middle of the robot's body is ahead of the pose (m). Paths are planned and followed for the body's middle.
-# Gazebo's pose is the rear axle: from the URDF meshes the body runs from 0.034 m behind it to 0.181 m ahead.
-# The real robot's Optitrack rigid body is taken to be at the body's middle, so its LiDAR is 0.114 - 0.074 m ahead of it
-SIM_BODY_OFFSET = 0.074
-REAL_BODY_OFFSET = 0.0
-SELF_MARGIN = 0.03 # m. A return within this of the robot's footprint is the robot itself (markers, cables), not the course
+# No map: the course is driven in stages, each from the latest scan. Stage 1 avoids obstacles heading along the first
+# corridor until a way opens on the right. Stage 2 turns right and does the same until a way opens on the left.
+# Then the robot turns left, goes through the door, and passes the two moving obstacles one at a time
+ROBOT_WIDTH, ROBOT_LENGTH = 0.225, 0.289 # m
+SIM_BODY_OFFSET, REAL_BODY_OFFSET = 0.074, 0.0 # m, body centre ahead of the pose (Gazebo's pose is the rear axle)
+SIM_LIDAR_X, REAL_LIDAR_X = 0.114, 0.040 # m, LiDAR ahead of the pose
+LIDAR_YAW = math.pi # rad, the LiDAR is mounted backwards, so its angle 0 points behind the robot
 
-# Driving
 DT = 0.05 # s, timer period
-MAX_SPEED = 0.3 # m/s, the real robot's limit
-MAX_ACCEL = 0.5 # m/s^2. Speed ramps up at most this fast, but drops at once
-MAX_TURN = 0.6 # rad/s, move_2D's turn limit on the real robot
-MIN_TURN = 0.3 # rad/s. From CA2: the real robot doesn't turn any slower than this
-TURN_GAIN = 1.5 # rad/s of turn per rad of heading error, when turning in place
-LOOKAHEAD = 0.2 # m, how far along the path the carrot is
-TURN_IN_PLACE = math.radians(60) # turn in place when the carrot is further off the heading than this
-ALIGN_TOL = math.radians(3) # heading errors smaller than this count as zero
-ARRIVE_TOL = 0.05 # m, how close to the end of a path counts as arriving
-STOP_DISTANCE = 0.1 # m. Stop if a LiDAR return is this close in front of the robot's front edge
-REPLAN_PERIOD = 1.0 # s
+MARGIN = 0.05 # m kept from walls and static obstacles
+LOOKAHEAD = 1.0 # m. Steering counts a lane's free distance up to this: any further is just as good
+STEER_COST = 0.3 # m of free distance a direction gives up per rad it is away from the wanted heading
+STOP_GAP = 0.05 # m. Never drive closer than this to anything in front of the body
+HEADING_GAIN = 2.0 # rad/s of turn per rad of heading error
+TURN_IN_PLACE = math.radians(60) # Turn on the spot when the heading error is larger than this
+ALIGN_TOL = math.radians(3) # Heading errors smaller than this count as zero
+MIN_TURN = 0.3 # rad/s. Neither robot turns on the spot any slower than this
+OPEN = ROBOT_LENGTH # m. A side has opened when its wall is this much further away than it was along the corridor
 
-# Planning
-INFLATED = 1000.0 # cost of a cell within half the robot's width of an occupied cell
-CLEARANCE_WEIGHT = 4.0 # extra cost of a cell right next to an inflated one. Keeps paths in the middle of gaps
-MARGIN_COST = 20.0 # extra cost of a cell within WALL_MARGIN of an inflated one. Paths keep out unless a gap is too narrow
-EIGHT_NEIGHBOURS = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc]
-STEPS = [(dr, dc, math.hypot(dr, dc)) for dr, dc in EIGHT_NEIGHBOURS] # (row, col) step and its length in cells
+DOOR_LINE_UP = 1.5 * ROBOT_LENGTH # m from the door wall to the body centre, where the robot lines up on the door
+DOOR_TOL = 0.05 # m. How close to the line-up point counts as there. Lining up checks the robot's lane fits the door
 
-EXPLORE, HOLD, CROSS = "EXPLORE", "HOLD", "CROSS"
-
-def dilate(mask:np.ndarray, offsets) -> np.ndarray:
-    '''Grow the True cells of mask: a cell becomes True if a True cell is any (row, col) offset away from it'''
-    grown = mask.copy()
-    rows, cols = mask.shape
-    for dr, dc in offsets:
-        # grown[r + dr, c + dc] |= mask[r, c], for every cell at once
-        grown[max(dr, 0):rows + min(dr, 0), max(dc, 0):cols + min(dc, 0)] |= \
-            mask[max(-dr, 0):rows + min(-dr, 0), max(-dc, 0):cols + min(-dc, 0)]
-    return grown
-
-def disk(radius:float, cell_size:float) -> list:
-    '''(row, col) offsets of every cell within radius, rounded up to whole cells'''
-    r = int(np.ceil(radius / cell_size))
-    return [(dr, dc) for dr in range(-r, r + 1) for dc in range(-r, r + 1) if dr * dr + dc * dc <= r * r]
-
-def search(cost:np.ndarray, start:tuple, goal_mask:np.ndarray=None, goal:tuple=None) -> tuple:
-    '''Lowest-cost search over 8-connected cells from start (row, col).
-    With goal_mask, it stops at the first True cell it reaches: the nearest one by path cost. Without it, it reaches
-    every cell it can. With goal (row, col) it is A*, with the octile distance to goal as the heuristic, otherwise Dijkstra.
-    A path can leave an inflated cell but never enter one from a cell that isn't, so a robot that has drifted
-    close to a wall can still get out.
-    Returns (reached, parent, g): the goal cell reached (None if none), and each cell's parent and cost from start'''
-    cost = cost.copy()
-    cost[[0, -1], :] = np.inf # block the border, so neighbours never fall outside the grid
-    cost[:, [0, -1]] = np.inf
-    cost = cost.tolist() # lists are faster than numpy arrays for one cell at a time
-    if goal_mask is not None:
-        goal_mask = goal_mask.tolist()
-
-    def heuristic(r, c):
-        if goal is None:
-            return 0.0
-        dr, dc = abs(r - goal[0]), abs(c - goal[1])
-        return max(dr, dc) + (math.sqrt(2) - 1) * min(dr, dc)
-
-    g = {start: 0.0} # lowest cost found so far from start to each cell
-    parent = {start: None}
-    heap = [(heuristic(*start), start)]
-    closed = set()
-    while heap:
-        _, cell = heapq.heappop(heap)
-        if cell in closed:
-            continue
-        closed.add(cell)
-        r, c = cell
-        if goal_mask is not None and goal_mask[r][c]:
-            return cell, parent, g
-        inflated = cost[r][c] >= INFLATED
-        for dr, dc, length in STEPS:
-            nr, nc = r + dr, c + dc
-            step_cost = cost[nr][nc]
-            if step_cost == math.inf or (step_cost >= INFLATED and not inflated):
-                continue
-            new_g = g[cell] + length * step_cost
-            if new_g < g.get((nr, nc), math.inf):
-                g[(nr, nc)] = new_g
-                parent[(nr, nc)] = cell
-                heapq.heappush(heap, (new_g + heuristic(nr, nc), (nr, nc)))
-    return None, parent, g
-
-def plan_path(cost:np.ndarray, start:tuple, goal_mask:np.ndarray, goal:tuple=None):
-    '''Path from start to the nearest True cell of goal_mask as a list of (row, col), or None if none can be reached'''
-    cell, parent, _ = search(cost, start, goal_mask, goal)
-    if cell is None:
-        return None
-    path = []
-    while cell is not None:
-        path.append(cell)
-        cell = parent[cell]
-    return path[::-1]
-
-def plan_to(cost:np.ndarray, start:tuple, goal:tuple):
-    '''A* path from start to goal, both (row, col), or None if goal can't be reached'''
-    goal_mask = np.zeros(cost.shape, dtype=bool)
-    goal_mask[goal] = True
-    return plan_path(cost, start, goal_mask, goal)
+WAIT_GAP = 0.1 # m between the body front and a moving obstacle's line while waiting
+MOVING_SPEED = 0.05 # m/s. An obstacle slower than this isn't moving, or is turning round
+CROSS_SAFETY = 1.2 # Cross only if the obstacle can't be back for this many times the time the crossing takes
 
 class LidarNode(Node):
     def __init__(self):
@@ -189,26 +87,20 @@ class LidarNode(Node):
         self.is_simulation = None
 
     def sub_scan_callback(self, msg):
-        """Scan subscriber. Gazebo's bridge publishes the simulation clock on /clock, and the real robot never does.
-        The scan's size isn't reliable: a real LiDAR can send 360 beams or fewer too"""
-        topics = [name for name, _ in self.get_topic_names_and_types()]
-        self.is_simulation = "/clock" in topics
-        self.get_logger().info(f"{'Simulation' if self.is_simulation else 'Real robot'}: /clock is "
-                               f"{'' if self.is_simulation else 'not '}published. LiDAR: {len(msg.ranges)} beams, "
-                               f"angles {msg.angle_min:+.3f} to {msg.angle_max:+.3f} rad every {msg.angle_increment:.4f}, "
-                               f"ranges {msg.range_min:.2f} to {msg.range_max:.1f} m, {msg.time_increment * 1e3:.3f} ms between beams")
+        """Scan subscriber"""
+        if len(msg.ranges) <= 360: 
+            self.is_simulation = True
+        else:
+            self.is_simulation = False
 
 class ObstacleCourseNode(Node):
     '''Node to navigate obstacle course, using pose from either gazebo odometer or optitrack and lidar scan data'''
-    def __init__(self, is_simulation:bool=True, calibrate:bool=False, snapshots:str=None):
+    def __init__(self, is_simulation:bool=True, calibrate:bool=False):
         super().__init__('obstaclecourse')
         self.get_logger().info("Starting ObstacleCourseNode")
 
         self.is_simulation = is_simulation
         self.calibrate = calibrate # Real robot: only print poses, never drive
-        self.snapshots = snapshots # directory to save map snapshots in, for tools/view_map.py. None = don't save
-        if snapshots:
-            os.makedirs(snapshots, exist_ok=True)
         self.raw_pose = None # Pose exactly as Optitrack reported it (real robot only)
         self.frame = self.course = None
         self._ticks = 0
@@ -216,9 +108,7 @@ class ObstacleCourseNode(Node):
         if is_simulation:
             self.max_translate_velocity = 1.4
         else:
-            self.max_translate_velocity = 0.3 # Please keep this in place; 0.3m/s is more than fast enough
-        self.lidar_x, self.lidar_yaw = (SIM_LIDAR_X, SIM_LIDAR_YAW) if is_simulation else (REAL_LIDAR_X, REAL_LIDAR_YAW)
-        self.body_offset = SIM_BODY_OFFSET if is_simulation else REAL_BODY_OFFSET
+            self.max_translate_velocity = 0.3 # Please keep this in place; 0.3m/s is more than fast enough 
 
         self.sub_scan = self.create_subscription(LaserScan, "scan", self.sub_scan_callback, 2) # Subscribe to LiDAR scan data
 
@@ -244,93 +134,13 @@ class ObstacleCourseNode(Node):
         self.timer = self.create_timer(0.05, self.timer_callback)  # Runs at 20Hz. Can be changed.
 
         self.pose = None
-        self.pose_history = deque(maxlen=100) # recent (stamp, x, y, heading), to find the pose when each beam was taken
-        self.scan = None # latest LiDAR scan
-        self.trail = [] # pose at each scan added to the map, saved with the map on exit
-
-        self.course_map = None # created at the first scan with a pose
-        self.scan_count = 0 # number of scans added to the map
-        self.turning = False # True while turning in place. The map skips those scans
-        self.speed = 0.0 # last forward speed sent, for ramping up
-        self.state = EXPLORE
-        self.path = self.target = None # current path (world points) and where it leads
-        self.to_end = False # True once nothing is left to explore and the target is the end of the course
-        self.progress = -math.inf # farthest the robot has been from the start, as path cost. New targets are beyond it
-        self.plan_time = -math.inf # when the path was last planned
-        self.snapshot_time = -math.inf # when the last map snapshot was saved
 
     def sub_scan_callback(self, msg):
-        """Scan subscriber. Also adds the scan to the map"""
-        self.scan = msg
-        # This callback runs separately from timer_callback, so the pose check there doesn't cover it
-        if self.pose is None or self.turning:
-            return
-        if self.course_map is None:
-            self.course_map = CourseMap(self.pose[0], self.pose[1])
-            self.start = np.array((*self.centre(), self.pose[2])) # only frontiers ahead of this count
-
-        ranges, angles, _, _ = self.scan_points(msg)
-        # Place each beam from the pose when it was taken. A real LiDAR takes a tenth of a second or more to sweep, so
-        # while the robot turns, the last beams see the room from a different heading than the first. And the scan can
-        # wait in the queue while another callback runs, so the latest pose may be newer than the whole scan
-        poses = self.pose_at(stamp_seconds(msg.header.stamp) + np.arange(len(ranges)) * msg.time_increment)
-        heading = np.deg2rad(poses[:, 2])
-        lidar_xy = poses[:, :2] + self.lidar_x * np.stack((np.cos(heading), np.sin(heading)), axis=1)
-        self.scan_count += 1
-        self.course_map.update(lidar_xy, heading + angles, ranges, CourseMap.CELL_SIZE / msg.angle_increment, self.scan_count)
-        self.trail.append(self.pose.copy())
-        if self.snapshots:
-            self.save_snapshot()
-
-    def save_snapshot(self):
-        '''Save the map once a second, for tools/view_map.py. Runs here rather than in timer_callback so it also works
-        with --calibrate, where you push the robot by hand to check the map'''
-        now = self.get_clock().now().nanoseconds * 1e-9
-        if now - self.snapshot_time < 1.0:
-            return
-        self.snapshot_time = now
-        path = os.path.join(self.snapshots, f"map_{self.scan_count:06d}.npz")
-        with open(path + ".tmp", "wb") as f: # write, then rename, so the viewer never copies half a file
-            np.savez_compressed(f, **self.map_data())
-        os.replace(path + ".tmp", path)
-
-    def map_data(self) -> dict:
-        '''The map and what the robot is doing with it, as arrays to save. pose is the middle of the robot's body, like
-        start and the path, so the viewer draws the body where it is'''
-        m = self.course_map
-        return dict(occupancy=m.occupancy_map.astype(np.float16), dynamic=m.dynamic_map.astype(np.int32), origin=m.origin,
-                    cell_size=m.CELL_SIZE, trail=np.array(self.trail), scan_count=self.scan_count,
-                    pose=np.array((*self.centre(), self.pose[2])),
-                    start=self.start, state=self.state, path=np.empty((0, 2)) if self.path is None else self.path,
-                    target=np.full(2, np.nan) if self.target is None else self.target)
-
-    def scan_points(self, msg) -> tuple:
-        '''A scan's ranges, each beam's angle from the robot's heading (rad), and the returns' (x, y) from the middle of
-        the robot's body, x ahead and y to the left. Returns off the robot's own body, or under range_min, are nan'''
-        ranges = np.array(msg.ranges, dtype=float)
-        ranges[~(ranges >= msg.range_min)] = np.nan
-        angles = self.lidar_yaw + msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
-        with np.errstate(invalid="ignore"): # inf ranges
-            x, y = self.lidar_x - self.body_offset + ranges * np.cos(angles), ranges * np.sin(angles)
-        on_robot = (np.abs(x) < ROBOT_LENGTH / 2 + SELF_MARGIN) & (np.abs(y) < ROBOT_WIDTH / 2 + SELF_MARGIN)
-        ranges[on_robot] = x[on_robot] = y[on_robot] = np.nan
-        return ranges, angles, x, y
-
-    def pose_at(self, t) -> np.ndarray:
-        '''Pose [x, y, heading] at stamp t, interpolated between the recent poses. t can be an array, for one pose per
-        stamp. The latest pose where t isn't between them, such as when the pose source stops publishing while the robot
-        stands still, or its clock differs from the LiDAR's'''
-        t = np.asarray(t, dtype=float)
-        latest = np.broadcast_to(self.pose, t.shape + (3,))
-        history = np.array(self.pose_history)
-        if len(history) < 2:
-            return latest.copy()
-        stamps = history[:, 0]
-        heading = np.rad2deg(np.unwrap(np.deg2rad(history[:, 3])))
-        interpolated = np.stack((np.interp(t, stamps, history[:, 1]), np.interp(t, stamps, history[:, 2]),
-                                 wrap_deg(np.interp(t, stamps, heading))), axis=-1)
-        inside = (t >= stamps[0]) & (t <= stamps[-1])
-        return np.where(inside[..., None], interpolated, latest)
+        """Scan subscriber"""
+        if len(msg.ranges) <= 360:
+            self.last_scan = np.array(msg.ranges)
+        else:
+            self.last_scan = np.array(msg.ranges)[::2] 
 
     def yaw_from_quaternion(self, q):
         '''Returns yaw angle (in rad) for orientation based on given quaternion input q'''
@@ -346,13 +156,7 @@ class ObstacleCourseNode(Node):
         self.raw_pose = np.array((x,y,heading))
         x, y, heading = optitrack_to_maze(x, y, heading, self.frame) # CA2 maze frame, see optitrack_variables.config
         self.pose = np.array((x,y,heading))
-        self.pose_history.append((stamp_seconds(msg.header.stamp), *self.pose))
         return self.pose
-
-    def centre(self) -> np.ndarray:
-        '''(x, y) of the middle of the robot's body, body_offset ahead of the pose. Paths are planned and followed for it'''
-        heading = math.radians(self.pose[2])
-        return self.pose[:2] + self.body_offset * np.array((math.cos(heading), math.sin(heading)))
 
     def to_course(self, pose=None):
         '''Convert a pose [x, y, heading] (default: self.pose) from the CA2 maze frame to the final-project course frame. Optional; see [course] in optitrack_variables.config'''
@@ -365,7 +169,6 @@ class ObstacleCourseNode(Node):
         latest_pose_msg = msg.pose.pose 
         heading = np.rad2deg(self.yaw_from_quaternion(latest_pose_msg.orientation))
         self.pose = np.array((latest_pose_msg.position.x, latest_pose_msg.position.y, heading))
-        self.pose_history.append((stamp_seconds(msg.header.stamp), *self.pose))
         return self.pose
 
     def move_2D(self, x:float=0.0, y:float=0.0, turn:float=0.0):
@@ -378,426 +181,316 @@ class ObstacleCourseNode(Node):
         twist_msg.angular.x, twist_msg.angular.y, twist_msg.angular.z = 0.0, 0.0, float(turn)
         self.publisher_.publish(twist_msg)
 
+    def setup_run(self):
+        '''First tick with a pose and a scan. The course frame is the start pose: (0, 0), facing 0 deg along the first corridor'''
+        sim = self.is_simulation
+        self.start_pose = np.array(self.pose)
+        self.body_offset = SIM_BODY_OFFSET if sim else REAL_BODY_OFFSET
+        self.lidar_x = SIM_LIDAR_X if sim else REAL_LIDAR_X
+        self.cruise = 0.5 if sim else 0.25 # m/s
+        self.cross_speed = 0.8 if sim else 0.3 # m/s, past the moving obstacles
+        self.max_turn = 1.5 if sim else 0.6 # rad/s
+        self.accel = 1.0 if sim else 0.5 # m/s^2. Speed ramps up at most this fast, but drops at once
+        self.speed = 0.0
+        self.side_walls = [] # (how far along this corridor, where the wall on the side being watched was)
+        self.slow = 0.2 if sim else 0.1 # m/s, through the door
+        self.door = None # (wall x, gap middle y, gap width) in the course frame, once seen
+        self.line_up = DOOR_LINE_UP # m from the door wall to line up at, closer if something stands there
+        self.obstacle = None # the moving obstacle being passed, see new_obstacle()
+        self.passed = 0 # moving obstacles passed
+        self.set_state("STAGE1")
+
+    def set_state(self, state:str):
+        self.get_logger().info(f"{getattr(self, 'state', None)} -> {state}")
+        self.state = state
+        self.side_walls = []
+
+    def sense(self):
+        '''Pose and LiDAR returns in the course frame, refreshed every tick'''
+        self.now = self.get_clock().now().nanoseconds * 1e-9
+        x0, y0, h0 = self.start_pose
+        c0, s0 = math.cos(math.radians(h0)), math.sin(math.radians(h0))
+        dx, dy = self.pose[0] - x0, self.pose[1] - y0
+        self.cp = np.array((c0 * dx + s0 * dy, -s0 * dx + c0 * dy, wrap_deg(self.pose[2] - h0)))
+        h = math.radians(self.cp[2])
+        self.body = self.cp[:2] + self.body_offset * np.array((math.cos(h), math.sin(h)))
+        self.front_x = self.body[0] + ROBOT_LENGTH / 2 # only used facing 0 deg, past the door
+        self.rear_x = self.body[0] - ROBOT_LENGTH / 2
+
+        ranges = np.asarray(self.last_scan, dtype=float)
+        n = len(ranges)
+        if self.is_simulation:
+            angles = -3.14 + np.arange(n) * 6.28 / (n - 1) + LIDAR_YAW # URDF: 360 samples from -3.14 to 3.14
+        else:
+            angles = -math.pi + np.arange(n) * 2 * math.pi / n + LIDAR_YAW
+        ok = np.isfinite(ranges) & (ranges > 0.06) & (ranges < 8.0)
+        r, a = ranges[ok], angles[ok]
+        pts = np.column_stack((self.lidar_x - self.body_offset + r * np.cos(a), r * np.sin(a))) # from the body centre
+        on_robot = (np.abs(pts[:, 0]) < ROBOT_LENGTH / 2 + 0.03) & (np.abs(pts[:, 1]) < ROBOT_WIDTH / 2 + 0.03)
+        self.pts = pts[~on_robot] # robot frame: x ahead, y left
+        c, s = math.cos(h), math.sin(h)
+        self.cpts = self.body + self.pts @ np.array(((c, s), (-s, c))) # course frame
+
+    def heading_error(self, heading:float) -> float:
+        '''Course-frame heading (deg) -> error from the robot's heading (rad)'''
+        return math.radians(wrap_deg(heading - self.cp[2]))
+
+    def lane_free(self, pts:np.ndarray, direction:float, margin:float=MARGIN) -> float:
+        '''How far the robot's lane is free from the body centre, along a direction (rad) in the frame of pts'''
+        along = pts[:, 0] * math.cos(direction) + pts[:, 1] * math.sin(direction)
+        lateral = -pts[:, 0] * math.sin(direction) + pts[:, 1] * math.cos(direction)
+        hit = (along > 0) & (np.abs(lateral) < ROBOT_WIDTH / 2 + margin)
+        return float(along[hit].min()) if hit.any() else math.inf
+
+    def steer(self, heading:float, reach:float=LOOKAHEAD) -> float:
+        '''Obstacle avoidance: the direction whose lane is most open, near the wanted course-frame heading (deg).
+        Returns the heading error (rad) to drive with. The heading is only the general way to go, so at a corner the
+        robot doesn't turn straight to it, but to the open lane nearest it. Lanes free for reach (no more than
+        LOOKAHEAD) are all as good: when heading for a point, its distance'''
+        wanted = self.heading_error(heading)
+        # Directions within 90 deg of the wanted heading, never back the way the robot came. Free distance counts up to
+        # LOOKAHEAD, less STEER_COST for how far round a direction is, so the robot doesn't take a lane that's open but
+        # leads the wrong way
+        off = np.radians(np.arange(-90, 91, 3))
+        free = np.array([self.lane_free(self.pts, wanted + o) for o in off])
+        score = np.minimum(free, min(reach, LOOKAHEAD)) - STEER_COST * np.abs(off)
+        return math.radians(wrap_deg(math.degrees(wanted + off[np.argmax(score)])))
+
+    def drive(self, speed:float, error:float):
+        '''Forward speed and turn only. Turns on the spot when the heading error is over TURN_IN_PLACE; otherwise slows
+        with the heading error and with the free distance ahead. Speed ramps up by at most accel, but drops at once'''
+        front = self.lane_free(self.pts, 0.0, 0.0) - ROBOT_LENGTH / 2
+        if abs(error) > TURN_IN_PLACE:
+            speed = 0.0
+        speed = min(speed * math.cos(error) ** 2, max(0.0, 1.5 * (front - STOP_GAP)))
+        turn = float(np.clip(HEADING_GAIN * error, -self.max_turn, self.max_turn))
+        if speed == 0.0 and abs(error) > ALIGN_TOL and abs(turn) < MIN_TURN: # slower turns stall on the spot
+            turn = math.copysign(MIN_TURN, turn)
+        self.speed = speed if speed <= self.speed else min(speed, self.speed + self.accel * DT)
+        self.move_2D(self.speed, 0.0, turn)
+
+    def stop(self):
+        self.speed = 0.0
+        self.move_2D(0.0, 0.0, 0.0)
+
+    def side_opened(self, heading:float, side:float) -> bool:
+        '''Drive along a course-frame heading (deg) with obstacle avoidance. True once the wall on one side (side, deg:
+        -90 right, +90 left) has stepped back by OPEN from where it was along this corridor, and the robot's lane that
+        way is clear past it'''
+        self.drive(self.cruise, self.steer(heading))
+        direction = math.radians(heading + side)
+        u = np.array((math.cos(direction), math.sin(direction)))
+        wall = float(self.body @ u) + self.lane_free(self.cpts - self.body, direction) # how far the wall is that way, along u
+        # The farthest it has been is the wall: an obstacle on that side only ever makes it look closer. Taken over at
+        # least two robot lengths, so a robot that starts beside an obstacle has seen the wall past it
+        along = float(self.body @ (math.cos(math.radians(heading)), math.sin(math.radians(heading))))
+        seen = np.array(self.side_walls).reshape(-1, 2)
+        if len(seen) and np.ptp(seen[:, 0]) >= 2 * ROBOT_LENGTH and wall > seen[:, 1].max() + OPEN:
+            return True
+        if abs(self.heading_error(heading)) < math.radians(15): # while going straight, where the wall was
+            self.side_walls.append((along, wall))
+        return False
+
+    def find_door(self):
+        '''The door in the wall ahead as (wall x, gap middle y, gap width) in the course frame, or None. Walls are
+        rectilinear, so the door wall is a line of returns at one x. The door is a gap in it that the robot's lane
+        fits through, with wall at least the robot's width either side, so it isn't the gap between two obstacles that
+        happen to line up, and returns from beyond the wall showing through it, so it isn't a shadow of something in front'''
+        P = self.cpts[(self.cpts[:, 0] > self.body[0] + 0.2) & (np.abs(self.cpts[:, 1] - self.body[1]) < 1.5)]
+        if len(P) == 0:
+            return None
+        d = P - self.body
+        bearing = np.arctan2(d[:, 1], d[:, 0])
+        lines, counts = np.unique(np.round(P[:, 0] / 0.04) * 0.04, return_counts=True)
+        for x_wall in lines[counts >= 8]: # nearest first
+            ys = np.sort(P[np.abs(P[:, 0] - x_wall) < 0.04, 1])
+            gaps = np.diff(ys)
+            piece = np.concatenate(([0], np.cumsum(gaps >= ROBOT_WIDTH))) # pieces of wall: no gap the robot fits through
+            length = np.array([np.ptp(ys[piece == k]) for k in range(piece[-1] + 1)])
+            for i in np.flatnonzero((gaps > ROBOT_WIDTH + 2 * MARGIN) & (gaps < 3 * ROBOT_WIDTH)):
+                lo, hi = ys[i], ys[i + 1]
+                if min(length[piece[i]], length[piece[i + 1]]) < ROBOT_WIDTH:
+                    continue
+                b_lo = math.atan2(lo - self.body[1], x_wall - self.body[0])
+                b_hi = math.atan2(hi - self.body[1], x_wall - self.body[0])
+                through = P[(bearing > b_lo) & (bearing < b_hi), 0]
+                if len(through) and np.median(through) > x_wall + 0.2:
+                    return float(x_wall), float(lo + hi) / 2, float(hi - lo)
+        return None
+
+    def line_up_distance(self) -> float:
+        '''How far in front of the door wall (body centre) the robot can line up: DOOR_LINE_UP, or as much less as it
+        takes for the body, facing the door, to be clear of every return by MARGIN'''
+        x_wall, y_gap, _ = self.door
+        P = self.cpts
+        beside = np.abs(P[:, 1] - y_gap) < ROBOT_WIDTH / 2 + MARGIN
+        for d in np.arange(DOOR_LINE_UP, ROBOT_LENGTH / 2 + MARGIN, -0.02):
+            if not (beside & (np.abs(P[:, 0] - (x_wall - d)) < ROBOT_LENGTH / 2 + MARGIN)).any():
+                return float(d)
+        return ROBOT_LENGTH / 2 + MARGIN
+
+    def new_obstacle(self) -> dict:
+        '''What is known about the moving obstacle ahead: its line (x), depth, half-width, recent centre-y, the speeds
+        measured while it moves, its latest direction (v), and the lowest and highest its centre has been'''
+        return {"x": None, "depth": 0.0, "half": 0.0, "t": [], "y": [], "speeds": [], "v": 0.0, "lo": math.inf, "hi": -math.inf}
+
+    def track_obstacle(self):
+        '''Find the moving obstacle ahead: the nearest returns ahead of the body front, between the corridor's walls.
+        Keeps its recent centre-y, its speed, and how far it goes each way'''
+        o, P = self.obstacle, self.cpts
+        beside = P[np.abs(P[:, 0] - self.body[0]) < 0.1] # the corridor's walls, either side of the robot
+        above, below = beside[beside[:, 1] > self.body[1], 1], beside[beside[:, 1] < self.body[1], 1]
+        if len(above) == 0 or len(below) == 0:
+            return
+        P = P[(P[:, 0] > self.front_x) & (P[:, 1] < above.min() - MARGIN) & (P[:, 1] > below.max() + MARGIN)]
+        if len(P) == 0:
+            return
+        P = P[P[:, 0] < P[:, 0].min() + 0.15] # nearest returns only, not whatever is beyond
+        o["x"] = float(P[:, 0].min())
+        o["depth"] = max(o["depth"], 2 * float(np.ptp(P[:, 0]))) # LiDAR only sees the near half of it
+        o["half"] = max(o["half"], float(np.ptp(P[:, 1])) / 2)
+        o["t"].append(self.now)
+        o["y"].append(float(P[:, 1].min() + P[:, 1].max()) / 2)
+        o["lo"], o["hi"] = min(o["lo"], o["y"][-1]), max(o["hi"], o["y"][-1])
+        while o["t"][0] < self.now - 1.0:
+            o["t"].pop(0), o["y"].pop(0)
+        t, y = np.array(o["t"]), np.array(o["y"])
+        recent = t > self.now - 0.5
+        if recent.sum() < 4 or np.ptp(t[recent]) < 0.25:
+            return
+        v = float(np.polyfit(t[recent], y[recent], 1)[0])
+        if abs(v) > MOVING_SPEED:
+            o["v"] = v
+            o["speeds"].append(abs(v))
+
+    def crossing_safe(self, safety:float=CROSS_SAFETY) -> bool:
+        '''True if the moving obstacle is moving away from the robot's lane, and can't be back in it until well after
+        the robot has crossed its line. It moves back and forth, so it goes as far as it has been seen to go, but no
+        further: it may turn round right away if it's further than ever'''
+        o = self.obstacle
+        if o["x"] is None or len(o["speeds"]) == 0:
+            return False
+        y, half, v = o["y"][-1], o["half"], o["v"]
+        speed = float(np.percentile(o["speeds"], 90)) # its top speed, but not a noisy one
+        lane_lo, lane_hi = self.body[1] - ROBOT_WIDTH / 2 - MARGIN, self.body[1] + ROBOT_WIDTH / 2 + MARGIN
+        if v > 0 and y - half >= lane_hi: # above the lane, moving up
+            end, back = max(o["hi"], y), lane_hi + half
+        elif v < 0 and y + half <= lane_lo: # below the lane, moving down
+            end, back = min(o["lo"], y), lane_lo - half
+        else:
+            return False # in the lane, or coming towards it
+        back_in = (abs(end - y) + abs(end - back)) / speed # s until it is back in the lane
+        distance = o["x"] + o["depth"] + MARGIN - self.rear_x
+        crossing = distance / self.cross_speed + self.cross_speed / (2 * self.accel) # s, including speeding up
+        return back_in > safety * crossing
+
     def timer_callback(self):
         """Controller loop. Insert path planning and PID control logic here"""
         if self.pose is None:
             print("No pose detected")
             return # Does not run if no pose received from Odom or Optitrack
 
-        if self.calibrate:
+        if self.calibrate and self.raw_pose is not None:
             self._ticks += 1
             if self._ticks % 10 == 0: # twice a second
-                self.print_calibration()
+                ox, oy, oh = self.raw_pose
+                self.get_logger().info(f"optitrack ({ox:+.3f}, {oy:+.3f}, {oh:+7.1f} deg)  ->  maze ({self.pose[0]:+.3f}, {self.pose[1]:+.3f}, {self.pose[2]:+7.1f} deg)")
             return # Calibration mode: look, don't drive
 
         ###### INSERT CODE HERE ######
-        if self.course_map is None:
-            return # no scan has been added to the map yet
-        if self.state == EXPLORE:
-            self.explore()
-        elif self.state == HOLD:
-            self.hold()
-        else:
-            self.cross()
+        if not hasattr(self, "last_scan"):
+            return # waits for the first LiDAR scan
+        if not hasattr(self, "state"):
+            self.setup_run()
+        new_scan = self.last_scan is not getattr(self, "scan_ref", None)
+        self.scan_ref = self.last_scan
+        self.sense()
+
+        if self.state == "STAGE1": # along the first corridor until a way opens on the right
+            if self.side_opened(0.0, -90.0):
+                self.set_state("STAGE2")
+        elif self.state == "STAGE2": # right, then along that corridor until a way opens on the left
+            if self.side_opened(-90.0, 90.0):
+                self.set_state("DOOR_FIND")
+        # The door: find it in the wall ahead, drive to a point straight in front of it, face it, and go straight through
+        elif self.state == "DOOR_FIND": # left, avoiding obstacles, until the door shows
+            self.drive(self.cruise * 0.6, self.steer(0.0))
+            if new_scan:
+                self.door = self.find_door()
+                if self.door is not None:
+                    self.set_state("DOOR_LINE_UP")
+        elif self.state == "DOOR_LINE_UP":
+            x_wall, y_gap, _ = self.door
+            # The robot turns about its pose, so the pose goes where facing the door puts the body centre on its line
+            dx, dy = x_wall - self.line_up - self.body_offset - self.cp[0], y_gap - self.cp[1]
+            distance = math.hypot(dx, dy)
+            if distance < DOOR_TOL:
+                self.set_state("DOOR_ALIGN")
+            else:
+                if new_scan and x_wall - self.body[0] > DOOR_LINE_UP + 0.2: # update it while it's still well ahead
+                    seen = self.find_door()
+                    if seen is not None and abs(seen[0] - x_wall) < 0.1 and abs(seen[1] - y_gap) < 0.1:
+                        self.door = seen
+                if new_scan and distance > 0.2: # the robot's own body is filtered out, but not until it's there
+                    self.line_up = min(self.line_up, self.line_up_distance())
+                self.drive(min(self.cruise * 0.6, distance), self.steer(math.degrees(math.atan2(dy, dx)), distance))
+        elif self.state == "DOOR_ALIGN": # turn on the spot to face through the door
+            error = self.heading_error(0.0)
+            self.drive(0.0, error)
+            if abs(error) < ALIGN_TOL:
+                x_wall, y_gap, width = self.door
+                # Lined up if the robot's lane fits through the gap; otherwise go back to the line-up point
+                fits = abs(self.body[1] - y_gap) < (width - ROBOT_WIDTH) / 2 - MARGIN / 2
+                self.set_state("DOOR_PASS" if fits else "DOOR_LINE_UP")
+        elif self.state == "DOOR_PASS": # straight through, steering onto the door's middle
+            x_wall, y_gap, _ = self.door
+            self.drive(self.slow, self.heading_error(math.degrees(math.atan2(y_gap - self.body[1], DOOR_LINE_UP))))
+            if self.rear_x > x_wall + MARGIN:
+                self.obstacle = self.new_obstacle()
+                self.set_state("WAIT")
+
+        # Stage 3: the moving obstacles, one at a time. Wait in front of each one's line, keeping the lane the robot came
+        # through the door in, and cross once it's moving away and can't be back before the robot is past
+        elif self.state == "WAIT":
+            o = self.obstacle
+            if new_scan:
+                self.track_obstacle()
+            to_line = self.cruise * 0.5 if o["x"] is None else 2.0 * (o["x"] - WAIT_GAP - self.front_x)
+            self.drive(float(np.clip(to_line, 0.0, self.cruise)), self.heading_error(0.0))
+            if self.crossing_safe():
+                self.set_state("CROSS")
+        elif self.state == "CROSS":
+            o = self.obstacle
+            if new_scan and self.front_x < o["x"]: # past its line, the nearest returns ahead are the next obstacle's
+                self.track_obstacle()
+            self.drive(self.cross_speed, self.heading_error(0.0))
+            if self.rear_x > o["x"] + o["depth"] + MARGIN:
+                self.passed += 1
+                self.obstacle = self.new_obstacle()
+                self.set_state("WAIT" if self.passed < 2 else "DONE")
+            elif self.front_x < o["x"] - STOP_GAP and not self.crossing_safe(1.0): # it could be back first: wait again
+                self.set_state("WAIT")
+        else: # DONE
+            self.stop()
+
+        if self.now - getattr(self, "t_log", -math.inf) > 1.0:
+            self.t_log = self.now
+            o = self.obstacle
+            seen = "" if o is None or o["x"] is None else \
+                f" | obstacle x={o['x']:.2f} y={o['y'][-1]:+.2f} v={o['v']:+.2f} goes {o['lo']:+.2f} to {o['hi']:+.2f}"
+            self.get_logger().info(f"{self.state:6s} pose ({self.cp[0]:+.2f}, {self.cp[1]:+.2f}, {self.cp[2]:+6.1f}) "
+                                   f"v={self.speed:.2f}{seen}")
         ###### INSERT CODE HERE ######
-
-    def print_calibration(self):
-        '''--calibrate: the pose, and where the LiDAR's returns are around the robot, as the map will use them.
-        With a box straight in front of the robot, the nearest return should read about 0 deg'''
-        log = self.get_logger()
-        if self.raw_pose is not None:
-            ox, oy, oh = self.raw_pose
-            log.info(f"optitrack ({ox:+.3f}, {oy:+.3f}, {oh:+7.1f} deg)  ->  maze ({self.pose[0]:+.3f}, {self.pose[1]:+.3f}, {self.pose[2]:+7.1f} deg)")
-        else:
-            log.info(f"pose ({self.pose[0]:+.3f}, {self.pose[1]:+.3f}, {self.pose[2]:+7.1f} deg)")
-        if self.scan is None:
-            log.info("no LiDAR scan yet")
-            return
-        _, _, x, y = self.scan_points(self.scan)
-        distance, bearing = np.hypot(x, y), np.degrees(np.arctan2(y, x)) # from the robot's centre, 0 = ahead, +90 = left
-        seen = np.isfinite(distance)
-        if not seen.any():
-            log.info("LiDAR: no returns")
-            return
-        def towards(deg):
-            near = seen & (np.abs(wrap_deg(bearing - deg)) < 5)
-            return f"{np.min(distance[near]):.2f} m" if near.any() else "-"
-        i = int(np.nanargmin(distance))
-        # If the nearest thing is really straight ahead, this LiDAR yaw would make it read 0 deg
-        fixed_yaw = math.radians(wrap_deg(math.degrees(self.lidar_yaw) - bearing[i]))
-        log.info(f"LiDAR nearest {distance[i]:.2f} m at {bearing[i]:+.0f} deg (0 = ahead, +90 = left) | "
-                 f"ahead {towards(0)}, left {towards(90)}, behind {towards(180)}, right {towards(-90)} | "
-                 f"if the nearest thing is straight ahead, the LiDAR yaw should be {fixed_yaw:+.2f} rad (now {self.lidar_yaw:+.2f})")
-
-    def explore(self):
-        '''Follow the path to the target, replanning every REPLAN_PERIOD. Hold when it leads past a moving obstacle'''
-        self.replan_if_due()
-        if self.path is None:
-            self.drive(0.0, 0.0) # nothing left to explore: stay, keep mapping and replanning
-            return
-        path = self.path_ahead()
-        if self.find_crossing(path) is None:
-            self.follow(path)
-            return
-        self.state = HOLD
-        self.was_blocked, self.exits = False, 0
-        self.get_logger().info(f"{self.state}: moving obstacle ahead")
-
-    def hold(self):
-        '''Wait for a moving obstacle to leave the crossing twice, standing still while it's in the crossing, then cross.
-        While the crossing is clear, approach the sweep zone and face it.
-        Everything is recomputed every tick, because the sweep zone grows while the robot watches'''
-        self.replan_if_due()
-        path = None if self.path is None else self.path_ahead()
-        crossing = None if path is None else self.find_crossing(path)
-        if crossing is None:
-            self.state = EXPLORE
-            self.get_logger().info(f"{self.state}: no moving obstacle ahead any more")
-            return
-        start, end = crossing
-        out = min(end + int(np.ceil(ARRIVE_TOL / CourseMap.CELL_SIZE)), len(path) - 1) # ARRIVE_TOL past the zone's reach
-        blocked = self.crossing_blocked(path[start:end])
-        if self.was_blocked and not blocked:
-            self.exits += 1 # the obstacle has just left the crossing
-        self.was_blocked = blocked
-        if blocked:
-            self.drive(0.0, 0.0) # stay still, wherever the robot is, until the obstacle has passed
-            return
-        # Cross as the obstacle leaves for the second time. By then it has left, come back and left again, so the robot
-        # has waited at least one whole period. Having just left, it is moving away. Crossing at the first exit, the
-        # robot can't tell whether the obstacle is about to come back
-        if self.exits >= 2:
-            self.cross_path = path[:out + 1]
-            self.state = CROSS
-            self.get_logger().info(f"{self.state}: moving obstacle has left the crossing twice")
-            return
-        # Until then, approach the hold point while the crossing is clear. If the sweep zone has grown around the
-        # robot (start == 0), it's already as close as it gets: it stays where it is rather than looking for a way out
-        if start > 0 and not self.follow(path[:start]):
-            return
-        # Face the far end of the crossing while waiting. It follows the sweep zone, so unlike the carrot it barely
-        # moves when the path is replanned, and the robot doesn't keep turning (and skipping scans)
-        dx, dy = path[out] - self.centre()
-        alpha = math.radians(wrap_deg(math.degrees(math.atan2(dy, dx)) - self.pose[2]))
-        if abs(alpha) > ALIGN_TOL:
-            self.turn_in_place(alpha)
-            return
-        self.drive(0.0, 0.0)
-
-    def cross(self):
-        '''Drive through the crossing without stopping. Then go back to exploring'''
-        if self.follow(self.cross_path, safety=False):
-            self.state = EXPLORE
-            self.plan_time = -math.inf # replan at once
-            self.get_logger().info(f"{self.state}: crossed")
-
-    def replan_if_due(self):
-        '''Replan if REPLAN_PERIOD has passed since the last plan'''
-        now = self.get_clock().now().nanoseconds * 1e-9
-        if now - self.plan_time >= REPLAN_PERIOD:
-            self.plan_time = now
-            self.replan()
-
-    def path_ahead(self) -> np.ndarray:
-        '''The current path from the point closest to the robot'''
-        return self.path[np.argmin(np.linalg.norm(self.path - self.centre(), axis=1)):]
-
-    def replan(self):
-        '''Plan to the current target if it is still worth reaching, otherwise to the nearest frontier farther along the
-        course than the robot has been. With no such frontier, head for the end of the course: the reachable cell
-        farthest from the start. Sets self.path (world points) and self.target, both None if nothing can be reached'''
-        cost, blocked, reach = self.course_map.planning_grids()
-        allowed = self.course_map.ahead(self.start) & ~blocked & ~reach # where a target may be
-        frontier = self.course_map.frontier(allowed)
-        start = self.course_map.to_cell(self.centre())
-        cells = None
-        if self.target is not None:
-            goal = self.course_map.to_cell(self.target)
-            if frontier[goal] or (self.to_end and not frontier.any()):
-                cells = plan_to(cost, start, goal)
-        if cells is None:
-            # A new target must be farther from the start, by path cost, than the robot has ever been, so the robot never
-            # turns back to somewhere it has already passed. A robot's length of slack, as costs change with the map
-            from_start = self.cost_from_start(cost)
-            self.progress = max(self.progress, from_start[start])
-            onward = from_start > self.progress - ROBOT_LENGTH / CourseMap.CELL_SIZE
-            frontier &= onward
-            cells = plan_path(cost, start, frontier) if frontier.any() else None
-            self.to_end = False
-            if cells is None:
-                candidates = (self.course_map.occupancy_map < CourseMap.FREE) & allowed & onward
-                if candidates.any():
-                    end = np.unravel_index(np.argmax(np.where(candidates, from_start, -np.inf)), cost.shape)
-                    cells = plan_to(cost, start, (int(end[0]), int(end[1])))
-                self.to_end = True
-        self.path = None if cells is None else self.course_map.cells_to_world(np.array(cells))
-        self.target = None if cells is None else self.path[-1]
-        self.get_logger().debug(f"Planned in {self.get_clock().now().nanoseconds * 1e-9 - self.plan_time:.2f} s")
-
-    def cost_from_start(self, cost:np.ndarray) -> np.ndarray:
-        '''Path cost from the course start to every cell, -inf where it can't reach'''
-        _, _, g = search(cost, self.course_map.to_cell(self.start[:2]))
-        from_start = np.full(cost.shape, -np.inf)
-        cells = np.array(list(g))
-        from_start[cells[:, 0], cells[:, 1]] = list(g.values())
-        return from_start
-
-    def find_crossing(self, path:np.ndarray):
-        '''(start, end) indices of the first stretch of path within SWEEP_CLEARANCE of the sweep zone, or None'''
-        near = self.course_map.distances(self.course_map.dynamic_map >= 0, path) < SWEEP_CLEARANCE
-        if not near.any():
-            return None
-        start = int(np.argmax(near))
-        clear = np.flatnonzero(~near[start:])
-        return start, (start + int(clear[0]) if len(clear) else len(path))
-
-    def crossing_blocked(self, crossing:np.ndarray) -> bool:
-        '''True if either of the last two scans saw a moving obstacle within SWEEP_CLEARANCE of the crossing (world points).
-        Two, so one scan that misses the obstacle doesn't open a window that isn't there'''
-        moving_now = self.course_map.dynamic_map >= self.scan_count - 1
-        return bool(np.any(self.course_map.distances(moving_now, crossing) < SWEEP_CLEARANCE))
-
-    def carrot(self, path:np.ndarray) -> tuple:
-        '''Remaining path length from the robot, and the angle (rad) from its heading to the carrot:
-        the first path point at least LOOKAHEAD away, after the point closest to the robot'''
-        distances = np.linalg.norm(path - self.centre(), axis=1)
-        i = int(np.argmin(distances))
-        remaining = distances[i] + np.sum(np.linalg.norm(np.diff(path[i:], axis=0), axis=1))
-        far = np.flatnonzero(distances[i:] >= LOOKAHEAD)
-        dx, dy = (path[i + far[0]] if len(far) else path[-1]) - self.centre()
-        return remaining, math.radians(wrap_deg(math.degrees(math.atan2(dy, dx)) - self.pose[2]))
-
-    def follow(self, path:np.ndarray, safety:bool=True) -> bool:
-        '''Drive along path with pure pursuit. Returns True once the robot has reached the end'''
-        remaining, alpha = self.carrot(path)
-        if remaining < ARRIVE_TOL:
-            self.drive(0.0, 0.0)
-            return True
-        if abs(alpha) > TURN_IN_PLACE:
-            self.turn_in_place(alpha)
-            return False
-        if safety and self.blocked_ahead():
-            self.drive(0.0, 0.0) # wait for the map and the next plan to route around it
-            return False
-        # Ramp here rather than in drive(), so the turn rate matches the speed actually sent. Otherwise the robot spins
-        # at the full rate while it is still pulling away, which leaves the arc and maps scans mid-spin
-        speed = min(MAX_SPEED * math.cos(alpha), max(self.speed, 0.0) + MAX_ACCEL * DT)
-        turn = 2 * speed * math.sin(alpha) / LOOKAHEAD # turn rate along the arc through the carrot
-        if abs(turn) < MIN_TURN:
-            turn = 0.0 if abs(alpha) < ALIGN_TOL else math.copysign(MIN_TURN, alpha)
-        self.drive(speed, turn)
-        return False
-
-    def turn_in_place(self, alpha:float):
-        '''Turn on the spot towards a heading error of alpha (rad)'''
-        self.drive(0.0, math.copysign(np.clip(TURN_GAIN * abs(alpha), MIN_TURN, MAX_TURN), alpha))
-
-    def drive(self, speed:float, turn:float):
-        '''Send a forward speed (m/s) and turn rate (rad/s). Forward speed ramps up by at most MAX_ACCEL, but drops at once'''
-        self.speed = min(speed, max(self.speed, 0.0) + MAX_ACCEL * DT)
-        self.turning = speed == 0.0 and turn != 0.0
-        self.move_2D(self.speed, 0.0, turn)
-
-    def blocked_ahead(self) -> bool:
-        '''True if a LiDAR return is within STOP_DISTANCE in front of the robot's front edge'''
-        _, _, x, y = self.scan_points(self.scan)
-        x, y = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), np.nan_to_num(y) # no return -> 0, which never counts
-        ahead = (x > ROBOT_LENGTH / 2) & (x < ROBOT_LENGTH / 2 + STOP_DISTANCE) # beside the body, stopping can't help
-        return bool(np.any(ahead & (np.abs(y) < ROBOT_WIDTH / 2)))
-
-class CourseMap:
-    '''Two grids over the same cells, in the same frame as self.pose, that grow as the robot sees more.
-    occupancy_map holds walls and static obstacles as log-odds. dynamic_map holds, for each cell,
-    the number of the last scan that saw a moving obstacle there (-1 = never)'''
-    CELL_SIZE = 0.025 # 2.5 cm square cell
-    GROW_MARGIN = 1.0 # 1m of unknown space added when map grows
-
-    L_OCC = 0.85
-    L_FREE = -0.4
-    L_MIN, L_MAX = -4.0, 4.0
-
-    OCCUPIED = 1.0
-    FREE = -1.0
-    CONFIDENT_FREE = -2.0 # a hit is a moving obstacle if every cell within DYNAMIC_MARGIN of it is below this
-    DYNAMIC_MARGIN = 3 # cells. Covers pose error, so a wall hit that lands a little in front of the wall isn't dynamic
-    CONFIRM_DISTANCE = 0.2 # m. A moving obstacle moves less than this between scans (2 m/s at 10 scans a second)
-
-    def __init__(self, start_x, start_y):
-        """
-           y
-        4.0 ┌──────┬──────┬──────┬──────┐
-            │[2,0] │[2,1] │[2,2] │[2,3] │   row 2
-        3.0 ├──────┼──────┼──────┼──────┤
-            │[1,0] │[1,1] │[1,2] │[1,3] │   row 1
-        2.0 ├──────┼──────┼──────┼──────┤
-            │[0,0] │[0,1] │[0,2] │[0,3] │   row 0
-        1.0 └──────┴──────┴──────┴──────┘
-            2.0    3.0    4.0    5.0    6.0  x
-            col 0  col 1  col 2  col 3
-        """
-        self.occupancy_map = np.zeros((1, 1))
-        self.dynamic_map = np.full((1, 1), -1)
-        self.last_dynamic = np.zeros((0, 2)) # the previous scan's dynamic hits (world), to confirm the next scan's
-        self.origin = np.array((start_x, start_y))
-
-    def to_cells(self, xy: np.ndarray) -> np.ndarray:
-        """
-        World coordinate to cell coordiate.
-        NOTE: since input is x, y this fn returns (col, row) that u need to flip when indexing
-        """
-        return np.floor((xy - self.origin) / self.CELL_SIZE).astype(int)
-
-    def to_cell(self, xy:np.ndarray) -> tuple:
-        '''One world point -> its cell as (row, col), ready for indexing'''
-        col, row = self.to_cells(xy[None, :])[0]
-        return int(row), int(col)
-
-    def cells_to_world(self, cells:np.ndarray) -> np.ndarray:
-        '''Cells (N, 2) as (row, col) -> world positions (N, 2) of their centres'''
-        return self.origin + (cells[:, ::-1] + 0.5) * self.CELL_SIZE
-
-    def to_flat_cells(self, xy:np.ndarray) -> np.ndarray:
-        """
-        returns idx of cell if matrix is flattened
-        """
-
-        cells = self.to_cells(xy)
-
-        return np.unique(cells[:, 1] * self.occupancy_map.shape[1] + cells[:, 0])
-
-    def grow_map_to_fit(self, xy: np.ndarray):
-        cells = self.to_cells(xy)
-        rows, cols = self.occupancy_map.shape
-
-        # Keep a border of DYNAMIC_MARGIN cells, so every cell the dynamic test checks around a hit is inside the map
-        m = self.DYNAMIC_MARGIN
-        below = np.maximum(m - cells.min(axis = 0), 0) # cells needed before col m, row m
-        above = np.maximum(cells.max(axis=0) - (cols - 1 - m, rows - 1 - m), 0) # cells needed after col, row -1-m
-
-        if not (below.any() or above.any()):
-            # no need to grow map
-            return
-
-        margin = int(self.GROW_MARGIN / self.CELL_SIZE)
-
-        before = np.where(below > 0, below + margin, 0)
-        after = np.where(above > 0, above + margin, 0)
-
-        pad = ((before[1], after[1]), (before[0], after[0]))
-        self.occupancy_map = np.pad(self.occupancy_map, pad)
-        self.dynamic_map = np.pad(self.dynamic_map, pad, constant_values=-1)
-
-        self.origin = self.origin - before * self.CELL_SIZE
-
-    def update(self, lidar_xy: np.ndarray, angles: np.ndarray, ranges: np.ndarray, max_range: float, scan_number: int):
-        '''Add a scan. lidar_xy is where the LiDAR was, either one (x, y) or one per beam'''
-        valid = np.isfinite(ranges)
-        if not valid.any():
-            return
-        lidar_xy = np.broadcast_to(lidar_xy, (len(ranges), 2))[valid]
-        angles, ranges = angles[valid], ranges[valid]
-
-        is_hit = ranges <= max_range
-        ranges = np.minimum(ranges, max_range)
-        directions = np.stack((np.cos(angles), np.sin(angles)), axis = 1)
-        ends = lidar_xy + ranges[:, None] * directions
-
-        self.grow_map_to_fit(np.vstack((lidar_xy, ends)))
-
-        steps = np.arange(0.0, max_range, self.CELL_SIZE / 2)
-        before_end = steps[None, :] < ranges[:, None] - self.CELL_SIZE
-
-        samples = lidar_xy[:, None, :] + steps[None, :, None] * directions[:, None, :]
-        free = self.to_flat_cells(samples[before_end])
-        hits = self.to_flat_cells(ends[is_hit])
-
-        grid = self.occupancy_map.reshape(-1)
-        # Beams can't pass through anything static, so a hit where beams keep passing is a moving obstacle.
-        # Checking the cells around it too stops hits just in front of a wall, from noise or pose error, from counting
-        cols = self.occupancy_map.shape[1]
-        offsets = np.arange(-self.DYNAMIC_MARGIN, self.DYNAMIC_MARGIN + 1)
-        neighbourhood = (offsets[:, None] * cols + offsets).ravel()
-        dynamic = np.all(grid[hits[:, None] + neighbourhood] < self.CONFIDENT_FREE, axis=1)
-
-        grid[free] += self.L_FREE
-        grid[hits[~dynamic]] += self.L_OCC
-
-        np.clip(grid, self.L_MIN, self.L_MAX, out = grid)
-
-        # A moving obstacle shows up scan after scan, a little further along each time. One bad scan, such as one taken
-        # while the robot spins and placed a few degrees off, puts stray wall hits in cleared floor once only. So a
-        # dynamic hit only goes into the dynamic map if the previous scan also had one within CONFIRM_DISTANCE
-        points = self.cells_to_world(np.stack(np.divmod(hits[dynamic], cols), axis=1))
-        if len(points) and len(self.last_dynamic):
-            gaps = np.linalg.norm(points[:, None] - self.last_dynamic[None], axis=2)
-            confirmed = np.min(gaps, axis=1) < self.CONFIRM_DISTANCE
-        else:
-            confirmed = np.zeros(len(points), dtype=bool)
-        self.last_dynamic = points
-        self.dynamic_map.reshape(-1)[hits[dynamic][confirmed]] = scan_number
-
-    def planning_grids(self) -> tuple:
-        '''Returns (cost, blocked, reach), all the same shape as occupancy_map.
-        blocked: within half the robot's width of an occupied cell, so the robot's centre shouldn't go there.
-        reach: within SWEEP_CLEARANCE of the sweep zone, where a moving obstacle can touch the robot.
-        cost: cost of entering each cell. inf if occupied, INFLATED if blocked, otherwise higher the closer it is to a wall
-        or the sweep zone, and up to MARGIN_COST more within WALL_MARGIN of them'''
-        occupied = self.occupancy_map > self.OCCUPIED
-        blocked = dilate(occupied, disk(ROBOT_WIDTH / 2, self.CELL_SIZE))
-        sweep = self.dynamic_map >= 0
-
-        # Clearance: how many cells to the nearest blocked cell, counted up to the robot's width. The sweep zone, inflated
-        # the same way, counts too. Hits marked as moving never become walls, so a static thing wrongly marked as moving,
-        # such as a door post, would otherwise get no margin. The sweep zone costs a lot but isn't blocked, so a path still
-        # crosses it, the shortest way
-        clear_max = int(np.ceil(ROBOT_WIDTH / self.CELL_SIZE))
-        clearance = np.full(blocked.shape, clear_max)
-        near = blocked | dilate(sweep, disk(ROBOT_WIDTH / 2, self.CELL_SIZE))
-        for distance in range(clear_max):
-            clearance[near & (clearance == clear_max)] = distance
-            near = dilate(near, EIGHT_NEIGHBOURS)
-
-        cost = 1.0 + CLEARANCE_WEIGHT * (clear_max - clearance) / clear_max
-        # The wall margin costs a lot but can still be entered, so a gap only a little wider than the robot stays open.
-        # It's graded, highest next to blocked, so in such a gap the middle is still cheapest
-        margin_cells = WALL_MARGIN / self.CELL_SIZE
-        cost += MARGIN_COST * np.clip((margin_cells + 1 - clearance) / margin_cells, 0.0, 1.0)
-        cost[blocked] = INFLATED
-        cost[occupied] = np.inf
-        reach = dilate(sweep, disk(SWEEP_CLEARANCE, self.CELL_SIZE))
-        return cost, blocked, reach
-
-    def ahead(self, pose:np.ndarray) -> np.ndarray:
-        '''True for cells ahead of the line through pose's position at right angles to its heading'''
-        rows, cols = self.occupancy_map.shape
-        x = self.origin[0] + (np.arange(cols) + 0.5) * self.CELL_SIZE
-        y = self.origin[1] + (np.arange(rows) + 0.5) * self.CELL_SIZE
-        heading = np.deg2rad(pose[2])
-        return (x[None, :] - pose[0]) * np.cos(heading) + (y[:, None] - pose[1]) * np.sin(heading) > 0
-
-    def frontier(self, allowed:np.ndarray) -> np.ndarray:
-        '''Free cells next to an unknown cell, inside allowed'''
-        log_odds = self.occupancy_map
-        unknown = (log_odds >= self.FREE) & (log_odds <= self.OCCUPIED)
-        return (log_odds < self.FREE) & dilate(unknown, EIGHT_NEIGHBOURS) & allowed
-
-    def distances(self, mask:np.ndarray, points:np.ndarray) -> np.ndarray:
-        '''Distance from each world point (N, 2) to the centre of the nearest True cell of mask. inf if there are none'''
-        if not mask.any():
-            return np.full(len(points), np.inf)
-        centres = self.cells_to_world(np.argwhere(mask))
-        return np.min(np.linalg.norm(points[:, None] - centres[None], axis=2), axis=1)
-
+                
 
 def main(args=None):
     arg_parser = argparse.ArgumentParser(description="RB2301 final project")
     arg_parser.add_argument('--calibrate', action='store_true', help="Real robot: only print the Optitrack pose and the maze-frame pose twice a second, never drive")
-    arg_parser.add_argument('--snapshots', metavar='DIR', help="Save a map snapshot to DIR once a second, for tools/view_map.py")
     cli_args, ros_args = arg_parser.parse_known_args(args=args)
     print("Starting obstacle course")
     rclpy.init(args=ros_args)
 
-    # Wait for the LiDAR, then tell simulation from the real robot by Gazebo's /clock
+    # Use lidar scan length to determine if in simulation or not
     lidar = LidarNode()
     while lidar.is_simulation is None:
         rclpy.spin_once(lidar)
@@ -805,26 +498,13 @@ def main(args=None):
     lidar.destroy_node()
 
     # Start spinning the obstacle node and only stop once SystemExit error is raised within the node callback
-    obstacle = ObstacleCourseNode(is_simulation, cli_args.calibrate, cli_args.snapshots)
+    obstacle = ObstacleCourseNode(is_simulation, cli_args.calibrate)
     try:
         rclpy.spin(obstacle)
-    except (SystemExit, KeyboardInterrupt):
+    except SystemExit:
         print("Shutting down")
-    try:
-        obstacle.move_2D(0.0, 0.0, 0.0) # the base keeps the last command it was sent
-    except Exception: # the context may already be shut down by Ctrl+C
-        pass
-    save_map(obstacle)
     obstacle.destroy_node()
-    if rclpy.ok():
-        rclpy.shutdown()
-
-def save_map(node:ObstacleCourseNode, path:str="fp_map.npz"):
-    '''Save what the robot mapped, to check a run on a laptop with tools/view_map.py (PLAN.md section 10)'''
-    if node.course_map is None:
-        return
-    np.savez_compressed(path, **node.map_data())
-    print(f"Saved the map to {os.path.abspath(path)}")
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
