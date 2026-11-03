@@ -52,32 +52,20 @@ def load_frame(robot_number:int) -> tuple:
     course = {k: parser.getfloat("course", k, fallback=0.0) for k in ("origin_x", "origin_y", "rotation_deg")}
     return frame, course
 
-
-# No map: the course is driven in stages, each from the latest scan. Stage 1 avoids obstacles heading along the first
-# corridor until a way opens on the right. Stage 2 turns right and does the same until a way opens on the left.
-# Then the robot turns left, goes through the door, and passes the two moving obstacles one at a time
+# Obstacle course, leg by leg (no map): forward along the first corridor, turn right, forward along the second, turn
+# left back to the starting heading (saved at the start: it is the direction the gate is entered in), find the gate's
+# gap with the LiDAR, slide sideways to line up with it and drive straight through. Past the gate the heading is held
+# and the robot only moves forward, left and right: it stops in front of each swinging obstacle, waits until it has
+# swung clear, slides away from it and dashes past. Done after two.
 ROBOT_WIDTH, ROBOT_LENGTH = 0.225, 0.289 # m
 SIM_BODY_OFFSET, REAL_BODY_OFFSET = 0.074, 0.0 # m, body centre ahead of the pose (Gazebo's pose is the rear axle)
 SIM_LIDAR_X, REAL_LIDAR_X = 0.114, 0.040 # m, LiDAR ahead of the pose
-LIDAR_YAW = math.pi # rad, the LiDAR is mounted backwards, so its angle 0 points behind the robot
-
-DT = 0.05 # s, timer period
-MARGIN = 0.05 # m kept from walls and static obstacles
-LOOKAHEAD = 1.0 # m. Steering counts a lane's free distance up to this: any further is just as good
-STEER_COST = 0.3 # m of free distance a direction gives up per rad it is away from the wanted heading
-STOP_GAP = 0.05 # m. Never drive closer than this to anything in front of the body
-HEADING_GAIN = 2.0 # rad/s of turn per rad of heading error
-TURN_IN_PLACE = math.radians(60) # Turn on the spot when the heading error is larger than this
-ALIGN_TOL = math.radians(3) # Heading errors smaller than this count as zero
-MIN_TURN = 0.3 # rad/s. Neither robot turns on the spot any slower than this
-OPEN = ROBOT_LENGTH # m. A side has opened when its wall is this much further away than it was along the corridor
-
-DOOR_LINE_UP = 1.5 * ROBOT_LENGTH # m from the door wall to the body centre, where the robot lines up on the door
-DOOR_TOL = 0.05 # m. How close to the line-up point counts as there. Lining up checks the robot's lane fits the door
-
-WAIT_GAP = 0.1 # m between the body front and a moving obstacle's line while waiting
-MOVING_SPEED = 0.05 # m/s. An obstacle slower than this isn't moving, or is turning round
-CROSS_SAFETY = 1.2 # Cross only if the obstacle can't be back for this many times the time the crossing takes
+LIDAR_YAW = math.pi # rad. The LiDAR is mounted backwards: its angle 0 points behind the robot
+MARGIN = ROBOT_WIDTH / 4 # m, clearance kept from walls and obstacles
+CRUISE = 0.5 # m/s, normal speed (capped by the robot's own limit)
+ACCEL = 1.0 # m/s^2, speeds change at most this fast
+TURN_RATE = 1.0 # rad/s, top turn rate when rotating on the spot
+TURNS = [-90.0, 0.0] # deg: after leg 1 turn right; after leg 2 turn back to the starting heading
 
 class LidarNode(Node):
     def __init__(self):
@@ -182,207 +170,131 @@ class ObstacleCourseNode(Node):
         self.publisher_.publish(twist_msg)
 
     def setup_run(self):
-        '''First tick with a pose and a scan. The course frame is the start pose: (0, 0), facing 0 deg along the first corridor'''
-        sim = self.is_simulation
-        self.start_pose = np.array(self.pose)
-        self.body_offset = SIM_BODY_OFFSET if sim else REAL_BODY_OFFSET
-        self.lidar_x = SIM_LIDAR_X if sim else REAL_LIDAR_X
-        self.cruise = 0.5 if sim else 0.25 # m/s
-        self.cross_speed = 0.8 if sim else 0.3 # m/s, past the moving obstacles
-        self.max_turn = 1.5 if sim else 0.6 # rad/s
-        self.accel = 1.0 if sim else 0.5 # m/s^2. Speed ramps up at most this fast, but drops at once
-        self.speed = 0.0
-        self.side_walls = [] # (how far along this corridor, where the wall on the side being watched was)
-        self.slow = 0.2 if sim else 0.1 # m/s, through the door
-        self.door = None # (wall x, gap middle y, gap width) in the course frame, once seen
-        self.line_up = DOOR_LINE_UP # m from the door wall to line up at, closer if something stands there
-        self.obstacle = None # the moving obstacle being passed, see new_obstacle()
-        self.passed = 0 # moving obstacles passed
-        self.set_state("STAGE1")
+        '''First tick: save the starting heading and set up'''
+        self.start_heading = float(self.pose[2])
+        self.body_offset = SIM_BODY_OFFSET if self.is_simulation else REAL_BODY_OFFSET
+        self.lidar_x = SIM_LIDAR_X if self.is_simulation else REAL_LIDAR_X
+        self.cruise = min(CRUISE, self.max_translate_velocity)
+        self.dash_speed = min(2 * CRUISE, self.max_translate_velocity) # Past the moving obstacles
+        self.dt = self.timer.timer_period_ns * 1e-9
+        self.state, self.leg, self.target = "LEG", 0, self.start_heading
+        self.vx = self.vy = 0.0
+        self.play = None # How far the body can move across a corridor (its width less the body and margins), measured
+        self.open_from = None # Where the side opening to the next corridor starts, along the leg
+        self.way_on = True
+        self.margin = MARGIN # Halved only to squeeze through a gap too narrow for the full margin
+        self.in_gate = False
+        self.watch, self.crossed = [], 0
+        self.t_start = self.t_log = self.t_state = self.clock()
 
-    def set_state(self, state:str):
-        self.get_logger().info(f"{getattr(self, 'state', None)} -> {state}")
-        self.state = state
-        self.side_walls = []
+    def clock(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
 
-    def sense(self):
-        '''Pose and LiDAR returns in the course frame, refreshed every tick'''
-        self.now = self.get_clock().now().nanoseconds * 1e-9
-        x0, y0, h0 = self.start_pose
-        c0, s0 = math.cos(math.radians(h0)), math.sin(math.radians(h0))
-        dx, dy = self.pose[0] - x0, self.pose[1] - y0
-        self.cp = np.array((c0 * dx + s0 * dy, -s0 * dx + c0 * dy, wrap_deg(self.pose[2] - h0)))
-        h = math.radians(self.cp[2])
-        self.body = self.cp[:2] + self.body_offset * np.array((math.cos(h), math.sin(h)))
-        self.front_x = self.body[0] + ROBOT_LENGTH / 2 # only used facing 0 deg, past the door
-        self.rear_x = self.body[0] - ROBOT_LENGTH / 2
+    def set_state(self, state:str, message:str):
+        self.state, self.t_state = state, self.now
+        self.get_logger().info(f"[{self.now - self.t_start:5.1f}s] {message}")
 
-        ranges = np.asarray(self.last_scan, dtype=float)
-        n = len(ranges)
-        if self.is_simulation:
-            angles = -3.14 + np.arange(n) * 6.28 / (n - 1) + LIDAR_YAW # URDF: 360 samples from -3.14 to 3.14
+    def scan_points(self):
+        '''LiDAR returns relative to the body centre, robot frame (x forward, y left), without the robot itself'''
+        r = np.asarray(self.last_scan, dtype=float)
+        n = len(r)
+        a = (-3.14 + np.arange(n) * 6.28 / (n - 1) if self.is_simulation else -math.pi + np.arange(n) * 2 * math.pi / n) + LIDAR_YAW
+        ok = np.isfinite(r) & (r > 0)
+        p = np.column_stack((self.lidar_x + r[ok] * np.cos(a[ok]) - self.body_offset, r[ok] * np.sin(a[ok])))
+        self.pts = p[~((np.abs(p[:, 0]) < ROBOT_LENGTH / 2) & (np.abs(p[:, 1]) < ROBOT_WIDTH / 2))]
+
+    def free_ahead(self, offset:float=0.0, margin:float=None) -> float:
+        '''How far the front can go straight ahead, keeping the margin, with the body shifted sideways by offset'''
+        margin = self.margin if margin is None else margin
+        p = self.pts
+        hit = (np.abs(p[:, 1] - offset) < ROBOT_WIDTH / 2 + margin) & (p[:, 0] > ROBOT_LENGTH / 2)
+        return float(p[hit, 0].min() - ROBOT_LENGTH / 2 - margin) if hit.any() else np.inf
+
+    def side_room(self, side:int) -> float:
+        '''How far the body can slide to the left (side 1) or right (side -1), keeping the margin'''
+        p = self.pts
+        beside = (np.abs(p[:, 0]) < ROBOT_LENGTH / 2) & (side * p[:, 1] > 0)
+        return float((side * p[beside, 1]).min() - ROBOT_WIDTH / 2 - self.margin) if beside.any() else np.inf
+
+    def heading_error(self, target:float) -> float:
+        return math.radians(wrap_deg(target - self.pose[2]))
+
+    def stop_speed(self, room:float, top:float, accel:float=ACCEL) -> float:
+        '''Speed that can still stop within room'''
+        return min(top, math.sqrt(2 * accel * max(room, 0.0)))
+
+    def dash_time(self, distance:float, top:float, accel:float) -> float:
+        '''Time to cover distance from a standstill to a stop'''
+        if distance < top ** 2 / accel:
+            return 2 * math.sqrt(distance / accel)
+        return distance / top + top / accel
+
+    def go(self, forward:float, sideways:float, turn:float=None, accel:float=ACCEL):
+        '''Drive with smooth speed changes; holds the target heading unless a turn rate is given'''
+        step = accel * self.dt
+        self.vx += float(np.clip(forward - self.vx, -step, step))
+        self.vy += float(np.clip(sideways - self.vy, -step, step))
+        if turn is None:
+            turn = 2.0 * self.heading_error(self.target)
+        self.move_2D(self.vx, self.vy, turn)
+
+    def slide_speed(self, offset:float) -> float:
+        '''Sideways speed towards offset (m, left positive), slowing to stop before anything beside'''
+        side = 1 if offset > 0 else -1
+        return side * min(self.stop_speed(self.side_room(side), self.cruise / 2), 2.0 * abs(offset))
+
+    def lane_offset(self, look:float) -> float:
+        '''Sideways offset to drive at: centred between the walls, or the nearest offset with a clear way past an
+        obstacle in the way (keeping half the margin if the gap is too narrow for the full one)'''
+        self.margin = MARGIN
+        left, right = self.side_room(1), self.side_room(-1)
+        if max(left, right) < 3 * ROBOT_LENGTH: # Between two walls: measure the corridor and keep to its middle
+            self.play = max(self.play or 0.0, left + right)
+            centre = (left - right) / 2
         else:
-            angles = -math.pi + np.arange(n) * 2 * math.pi / n + LIDAR_YAW
-        ok = np.isfinite(ranges) & (ranges > 0.06) & (ranges < 8.0)
-        r, a = ranges[ok], angles[ok]
-        pts = np.column_stack((self.lidar_x - self.body_offset + r * np.cos(a), r * np.sin(a))) # from the body centre
-        on_robot = (np.abs(pts[:, 0]) < ROBOT_LENGTH / 2 + 0.03) & (np.abs(pts[:, 1]) < ROBOT_WIDTH / 2 + 0.03)
-        self.pts = pts[~on_robot] # robot frame: x ahead, y left
-        c, s = math.cos(h), math.sin(h)
-        self.cpts = self.body + self.pts @ np.array(((c, s), (-s, c))) # course frame
+            centre = 0.0
+        self.way_on = True # Whether there is a way past whatever is ahead
+        if self.free_ahead(0.0) >= look:
+            return centre
+        for margin in (MARGIN, MARGIN / 2):
+            self.margin = margin
+            reach = (-min(self.side_room(-1), 1.0), min(self.side_room(1), 1.0))
+            offsets = np.arange(reach[0], reach[1] + 0.005, 0.005)
+            free = np.array([self.free_ahead(o) for o in offsets])
+            clear = free >= look
+            if clear.any(): # In each clear run, the offset nearest the centre but a little inside the run's edges
+                runs = [r for r in np.split(np.arange(len(offsets)), np.where(np.diff(clear.astype(int)) != 0)[0] + 1) if clear[r[0]]]
+                inset = [min(MARGIN / 2, np.ptp(offsets[r]) / 2) for r in runs]
+                aims = [float(np.clip(centre, offsets[r[0]] + i, offsets[r[-1]] - i)) for r, i in zip(runs, inset)]
+                return min(aims, key=lambda o: abs(o - centre))
+        self.way_on, self.margin = False, MARGIN
+        return float(offsets[np.argmax(free)]) if len(offsets) else 0.0
 
-    def heading_error(self, heading:float) -> float:
-        '''Course-frame heading (deg) -> error from the robot's heading (rad)'''
-        return math.radians(wrap_deg(heading - self.cp[2]))
+    def gate_offset(self):
+        '''The gap in the wall ahead: the middle of the run of sideways offsets whose straight way reaches well past
+        the wall (the wall's own distance is the typical one). None if there is no gap the body fits through'''
+        offsets = np.arange(-1.0, 1.0, 0.01)
+        free = np.array([self.free_ahead(o) for o in offsets])
+        wall = float(np.median(free[np.isfinite(free)])) if np.isfinite(free).any() else np.inf
+        through = free > wall + ROBOT_LENGTH
+        if not through.any():
+            return None, wall
+        runs = np.split(np.arange(len(offsets)), np.where(np.diff(through.astype(int)) != 0)[0] + 1)
+        runs = [r for r in runs if through[r[0]]]
+        best = min(runs, key=lambda r: abs(offsets[r].mean()))
+        return float(offsets[best].mean()), wall
 
-    def lane_free(self, pts:np.ndarray, direction:float, margin:float=MARGIN) -> float:
-        '''How far the robot's lane is free from the body centre, along a direction (rad) in the frame of pts'''
-        along = pts[:, 0] * math.cos(direction) + pts[:, 1] * math.sin(direction)
-        lateral = -pts[:, 0] * math.sin(direction) + pts[:, 1] * math.cos(direction)
-        hit = (along > 0) & (np.abs(lateral) < ROBOT_WIDTH / 2 + margin)
-        return float(along[hit].min()) if hit.any() else math.inf
-
-    def steer(self, heading:float, reach:float=LOOKAHEAD) -> float:
-        '''Obstacle avoidance: the direction whose lane is most open, near the wanted course-frame heading (deg).
-        Returns the heading error (rad) to drive with. The heading is only the general way to go, so at a corner the
-        robot doesn't turn straight to it, but to the open lane nearest it. Lanes free for reach (no more than
-        LOOKAHEAD) are all as good: when heading for a point, its distance'''
-        wanted = self.heading_error(heading)
-        # Directions within 90 deg of the wanted heading, never back the way the robot came. Free distance counts up to
-        # LOOKAHEAD, less STEER_COST for how far round a direction is, so the robot doesn't take a lane that's open but
-        # leads the wrong way
-        off = np.radians(np.arange(-90, 91, 3))
-        free = np.array([self.lane_free(self.pts, wanted + o) for o in off])
-        score = np.minimum(free, min(reach, LOOKAHEAD)) - STEER_COST * np.abs(off)
-        return math.radians(wrap_deg(math.degrees(wanted + off[np.argmax(score)])))
-
-    def drive(self, speed:float, error:float):
-        '''Forward speed and turn only. Turns on the spot when the heading error is over TURN_IN_PLACE; otherwise slows
-        with the heading error and with the free distance ahead. Speed ramps up by at most accel, but drops at once'''
-        front = self.lane_free(self.pts, 0.0, 0.0) - ROBOT_LENGTH / 2
-        if abs(error) > TURN_IN_PLACE:
-            speed = 0.0
-        speed = min(speed * math.cos(error) ** 2, max(0.0, 1.5 * (front - STOP_GAP)))
-        turn = float(np.clip(HEADING_GAIN * error, -self.max_turn, self.max_turn))
-        if speed == 0.0 and abs(error) > ALIGN_TOL and abs(turn) < MIN_TURN: # slower turns stall on the spot
-            turn = math.copysign(MIN_TURN, turn)
-        self.speed = speed if speed <= self.speed else min(speed, self.speed + self.accel * DT)
-        self.move_2D(self.speed, 0.0, turn)
-
-    def stop(self):
-        self.speed = 0.0
-        self.move_2D(0.0, 0.0, 0.0)
-
-    def side_opened(self, heading:float, side:float) -> bool:
-        '''Drive along a course-frame heading (deg) with obstacle avoidance. True once the wall on one side (side, deg:
-        -90 right, +90 left) has stepped back by OPEN from where it was along this corridor, and the robot's lane that
-        way is clear past it'''
-        self.drive(self.cruise, self.steer(heading))
-        direction = math.radians(heading + side)
-        u = np.array((math.cos(direction), math.sin(direction)))
-        wall = float(self.body @ u) + self.lane_free(self.cpts - self.body, direction) # how far the wall is that way, along u
-        # The farthest it has been is the wall: an obstacle on that side only ever makes it look closer. Taken over at
-        # least two robot lengths, so a robot that starts beside an obstacle has seen the wall past it
-        along = float(self.body @ (math.cos(math.radians(heading)), math.sin(math.radians(heading))))
-        seen = np.array(self.side_walls).reshape(-1, 2)
-        if len(seen) and np.ptp(seen[:, 0]) >= 2 * ROBOT_LENGTH and wall > seen[:, 1].max() + OPEN:
-            return True
-        if abs(self.heading_error(heading)) < math.radians(15): # while going straight, where the wall was
-            self.side_walls.append((along, wall))
-        return False
-
-    def find_door(self):
-        '''The door in the wall ahead as (wall x, gap middle y, gap width) in the course frame, or None. Walls are
-        rectilinear, so the door wall is a line of returns at one x. The door is a gap in it that the robot's lane
-        fits through, with wall at least the robot's width either side, so it isn't the gap between two obstacles that
-        happen to line up, and returns from beyond the wall showing through it, so it isn't a shadow of something in front'''
-        P = self.cpts[(self.cpts[:, 0] > self.body[0] + 0.2) & (np.abs(self.cpts[:, 1] - self.body[1]) < 1.5)]
-        if len(P) == 0:
+    def obstacle_ahead(self):
+        '''The nearest thing ahead between the side walls: (distance from the front, its left and right edges)'''
+        left, right = self.side_room(1), self.side_room(-1)
+        p = self.pts
+        x = p[:, 0] - ROBOT_LENGTH / 2
+        inside = (x > 0) & (p[:, 1] < left + ROBOT_WIDTH / 2) & (p[:, 1] > -right - ROBOT_WIDTH / 2)
+        if not inside.any():
             return None
-        d = P - self.body
-        bearing = np.arctan2(d[:, 1], d[:, 0])
-        lines, counts = np.unique(np.round(P[:, 0] / 0.04) * 0.04, return_counts=True)
-        for x_wall in lines[counts >= 8]: # nearest first
-            ys = np.sort(P[np.abs(P[:, 0] - x_wall) < 0.04, 1])
-            gaps = np.diff(ys)
-            piece = np.concatenate(([0], np.cumsum(gaps >= ROBOT_WIDTH))) # pieces of wall: no gap the robot fits through
-            length = np.array([np.ptp(ys[piece == k]) for k in range(piece[-1] + 1)])
-            for i in np.flatnonzero((gaps > ROBOT_WIDTH + 2 * MARGIN) & (gaps < 3 * ROBOT_WIDTH)):
-                lo, hi = ys[i], ys[i + 1]
-                if min(length[piece[i]], length[piece[i + 1]]) < ROBOT_WIDTH:
-                    continue
-                b_lo = math.atan2(lo - self.body[1], x_wall - self.body[0])
-                b_hi = math.atan2(hi - self.body[1], x_wall - self.body[0])
-                through = P[(bearing > b_lo) & (bearing < b_hi), 0]
-                if len(through) and np.median(through) > x_wall + 0.2:
-                    return float(x_wall), float(lo + hi) / 2, float(hi - lo)
-        return None
-
-    def line_up_distance(self) -> float:
-        '''How far in front of the door wall (body centre) the robot can line up: DOOR_LINE_UP, or as much less as it
-        takes for the body, facing the door, to be clear of every return by MARGIN'''
-        x_wall, y_gap, _ = self.door
-        P = self.cpts
-        beside = np.abs(P[:, 1] - y_gap) < ROBOT_WIDTH / 2 + MARGIN
-        for d in np.arange(DOOR_LINE_UP, ROBOT_LENGTH / 2 + MARGIN, -0.02):
-            if not (beside & (np.abs(P[:, 0] - (x_wall - d)) < ROBOT_LENGTH / 2 + MARGIN)).any():
-                return float(d)
-        return ROBOT_LENGTH / 2 + MARGIN
-
-    def new_obstacle(self) -> dict:
-        '''What is known about the moving obstacle ahead: its line (x), depth, half-width, recent centre-y, the speeds
-        measured while it moves, its latest direction (v), and the lowest and highest its centre has been'''
-        return {"x": None, "depth": 0.0, "half": 0.0, "t": [], "y": [], "speeds": [], "v": 0.0, "lo": math.inf, "hi": -math.inf}
-
-    def track_obstacle(self):
-        '''Find the moving obstacle ahead: the nearest returns ahead of the body front, between the corridor's walls.
-        Keeps its recent centre-y, its speed, and how far it goes each way'''
-        o, P = self.obstacle, self.cpts
-        beside = P[np.abs(P[:, 0] - self.body[0]) < 0.1] # the corridor's walls, either side of the robot
-        above, below = beside[beside[:, 1] > self.body[1], 1], beside[beside[:, 1] < self.body[1], 1]
-        if len(above) == 0 or len(below) == 0:
-            return
-        P = P[(P[:, 0] > self.front_x) & (P[:, 1] < above.min() - MARGIN) & (P[:, 1] > below.max() + MARGIN)]
-        if len(P) == 0:
-            return
-        P = P[P[:, 0] < P[:, 0].min() + 0.15] # nearest returns only, not whatever is beyond
-        o["x"] = float(P[:, 0].min())
-        o["depth"] = max(o["depth"], 2 * float(np.ptp(P[:, 0]))) # LiDAR only sees the near half of it
-        o["half"] = max(o["half"], float(np.ptp(P[:, 1])) / 2)
-        o["t"].append(self.now)
-        o["y"].append(float(P[:, 1].min() + P[:, 1].max()) / 2)
-        o["lo"], o["hi"] = min(o["lo"], o["y"][-1]), max(o["hi"], o["y"][-1])
-        while o["t"][0] < self.now - 1.0:
-            o["t"].pop(0), o["y"].pop(0)
-        t, y = np.array(o["t"]), np.array(o["y"])
-        recent = t > self.now - 0.5
-        if recent.sum() < 4 or np.ptp(t[recent]) < 0.25:
-            return
-        v = float(np.polyfit(t[recent], y[recent], 1)[0])
-        if abs(v) > MOVING_SPEED:
-            o["v"] = v
-            o["speeds"].append(abs(v))
-
-    def crossing_safe(self, safety:float=CROSS_SAFETY) -> bool:
-        '''True if the moving obstacle is moving away from the robot's lane, and can't be back in it until well after
-        the robot has crossed its line. It moves back and forth, so it goes as far as it has been seen to go, but no
-        further: it may turn round right away if it's further than ever'''
-        o = self.obstacle
-        if o["x"] is None or len(o["speeds"]) == 0:
-            return False
-        y, half, v = o["y"][-1], o["half"], o["v"]
-        speed = float(np.percentile(o["speeds"], 90)) # its top speed, but not a noisy one
-        lane_lo, lane_hi = self.body[1] - ROBOT_WIDTH / 2 - MARGIN, self.body[1] + ROBOT_WIDTH / 2 + MARGIN
-        if v > 0 and y - half >= lane_hi: # above the lane, moving up
-            end, back = max(o["hi"], y), lane_hi + half
-        elif v < 0 and y + half <= lane_lo: # below the lane, moving down
-            end, back = min(o["lo"], y), lane_lo - half
-        else:
-            return False # in the lane, or coming towards it
-        back_in = (abs(end - y) + abs(end - back)) / speed # s until it is back in the lane
-        distance = o["x"] + o["depth"] + MARGIN - self.rear_x
-        crossing = distance / self.cross_speed + self.cross_speed / (2 * self.accel) # s, including speeding up
-        return back_in > safety * crossing
+        line = x[inside].min()
+        face = inside & (x < line + MARGIN)
+        return float(line), float(p[face, 1].min()), float(p[face, 1].max())
 
     def timer_callback(self):
         """Controller loop. Insert path planning and PID control logic here"""
@@ -399,87 +311,132 @@ class ObstacleCourseNode(Node):
 
         ###### INSERT CODE HERE ######
         if not hasattr(self, "last_scan"):
-            return # waits for the first LiDAR scan
-        if not hasattr(self, "state"):
+            return # Waits for the first LiDAR scan
+        if not hasattr(self, "t_start"):
             self.setup_run()
-        new_scan = self.last_scan is not getattr(self, "scan_ref", None)
-        self.scan_ref = self.last_scan
-        self.sense()
+        self.now = self.clock()
+        self.scan_points()
+        self.margin = MARGIN
+        h0 = math.radians(self.start_heading)
+        along = math.cos(h0) * self.pose[0] + math.sin(h0) * self.pose[1] # Position along / across the starting heading
+        across = -math.sin(h0) * self.pose[0] + math.cos(h0) * self.pose[1]
+        left, right = self.side_room(1), self.side_room(-1)
+        look = ROBOT_LENGTH + self.cruise ** 2 / (2 * ACCEL) # Far enough ahead to stop and still slide round
 
-        if self.state == "STAGE1": # along the first corridor until a way opens on the right
-            if self.side_opened(0.0, -90.0):
-                self.set_state("STAGE2")
-        elif self.state == "STAGE2": # right, then along that corridor until a way opens on the left
-            if self.side_opened(-90.0, 90.0):
-                self.set_state("DOOR_FIND")
-        # The door: find it in the wall ahead, drive to a point straight in front of it, face it, and go straight through
-        elif self.state == "DOOR_FIND": # left, avoiding obstacles, until the door shows
-            self.drive(self.cruise * 0.6, self.steer(0.0))
-            if new_scan:
-                self.door = self.find_door()
-                if self.door is not None:
-                    self.set_state("DOOR_LINE_UP")
-        elif self.state == "DOOR_LINE_UP":
-            x_wall, y_gap, _ = self.door
-            # The robot turns about its pose, so the pose goes where facing the door puts the body centre on its line
-            dx, dy = x_wall - self.line_up - self.body_offset - self.cp[0], y_gap - self.cp[1]
-            distance = math.hypot(dx, dy)
-            if distance < DOOR_TOL:
-                self.set_state("DOOR_ALIGN")
-            else:
-                if new_scan and x_wall - self.body[0] > DOOR_LINE_UP + 0.2: # update it while it's still well ahead
-                    seen = self.find_door()
-                    if seen is not None and abs(seen[0] - x_wall) < 0.1 and abs(seen[1] - y_gap) < 0.1:
-                        self.door = seen
-                if new_scan and distance > 0.2: # the robot's own body is filtered out, but not until it's there
-                    self.line_up = min(self.line_up, self.line_up_distance())
-                self.drive(min(self.cruise * 0.6, distance), self.steer(math.degrees(math.atan2(dy, dx)), distance))
-        elif self.state == "DOOR_ALIGN": # turn on the spot to face through the door
-            error = self.heading_error(0.0)
-            self.drive(0.0, error)
-            if abs(error) < ALIGN_TOL:
-                x_wall, y_gap, width = self.door
-                # Lined up if the robot's lane fits through the gap; otherwise go back to the line-up point
-                fits = abs(self.body[1] - y_gap) < (width - ROBOT_WIDTH) / 2 - MARGIN / 2
-                self.set_state("DOOR_PASS" if fits else "DOOR_LINE_UP")
-        elif self.state == "DOOR_PASS": # straight through, steering onto the door's middle
-            x_wall, y_gap, _ = self.door
-            self.drive(self.slow, self.heading_error(math.degrees(math.atan2(y_gap - self.body[1], DOOR_LINE_UP))))
-            if self.rear_x > x_wall + MARGIN:
-                self.obstacle = self.new_obstacle()
-                self.set_state("WAIT")
+        if self.state == "DONE":
+            self.move_2D(0.0, 0.0, 0.0)
+            return
 
-        # Stage 3: the moving obstacles, one at a time. Wait in front of each one's line, keeping the lane the robot came
-        # through the door in, and cross once it's moving away and can't be back before the robot is past
-        elif self.state == "WAIT":
-            o = self.obstacle
-            if new_scan:
-                self.track_obstacle()
-            to_line = self.cruise * 0.5 if o["x"] is None else 2.0 * (o["x"] - WAIT_GAP - self.front_x)
-            self.drive(float(np.clip(to_line, 0.0, self.cruise)), self.heading_error(0.0))
-            if self.crossing_safe():
-                self.set_state("CROSS")
-        elif self.state == "CROSS":
-            o = self.obstacle
-            if new_scan and self.front_x < o["x"]: # past its line, the nearest returns ahead are the next obstacle's
-                self.track_obstacle()
-            self.drive(self.cross_speed, self.heading_error(0.0))
-            if self.rear_x > o["x"] + o["depth"] + MARGIN:
-                self.passed += 1
-                self.obstacle = self.new_obstacle()
-                self.set_state("WAIT" if self.passed < 2 else "DONE")
-            elif self.front_x < o["x"] - STOP_GAP and not self.crossing_safe(1.0): # it could be back first: wait again
-                self.set_state("WAIT")
-        else: # DONE
-            self.stop()
+        if self.state == "LEG": # Forward along a corridor, centred, sliding round obstacles, until it turns
+            side = -1 if self.leg == 0 else 1 # The side the next corridor opens to
+            h = math.radians(self.target)
+            along_leg = math.cos(h) * self.pose[0] + math.sin(h) * self.pose[1]
+            offset = self.lane_offset(look) # (May halve the margin for a narrow gap)
+            ahead = self.free_ahead()
+            if self.open_from is None and self.play is not None and self.side_room(side) > self.play + MARGIN:
+                self.open_from = along_leg - ROBOT_LENGTH / 2 # The opening's near edge has just passed the body's rear
+            if self.open_from is None and ahead < 0.02 and not self.way_on and self.side_room(side) > self.side_room(-side):
+                self.open_from = along_leg # Blocked right across: the end wall, its opening hidden by something
+            to_stop = ahead
+            if self.open_from is not None: # Stop with the body in the middle of the opening (its far edge: the wall ahead)
+                to_stop = min(ahead, (self.open_from + along_leg + ROBOT_LENGTH / 2 + MARGIN + ahead) / 2 - along_leg)
+                if to_stop < 0.02 and abs(self.vx) < 0.05:
+                    self.target, self.open_from = self.start_heading + TURNS[self.leg], None
+                    self.set_state("ROTATE", f"End of leg {self.leg + 1}: turning {'right' if side < 0 else 'left'}")
+                    return
+            self.go(self.stop_speed(to_stop, self.cruise), self.slide_speed(offset))
 
-        if self.now - getattr(self, "t_log", -math.inf) > 1.0:
+        elif self.state == "ROTATE": # On the spot, once there's room to swing the body round
+            axle = np.array((-self.body_offset, 0.0)) # The robot turns about its pose
+            swing = math.hypot(ROBOT_LENGTH / 2 + self.body_offset, ROBOT_WIDTH / 2)
+            d = np.hypot(*(self.pts - axle).T)
+            if d.min() < swing + MARGIN / 2: # Too close to something: move away from it first
+                away = -(self.pts[np.argmin(d)] - axle) / d.min()
+                self.go(*(away * self.cruise / 4), 0.0)
+                return
+            err = self.heading_error(self.target)
+            if abs(err) < math.radians(1.5):
+                self.vx = self.vy = 0.0
+                self.leg += 1
+                if self.leg == 1:
+                    self.set_state("LEG", "Leg 2: forward")
+                else:
+                    self.set_state("GATE", "Facing the starting heading: looking for the gate")
+                return
+            self.go(0.0, 0.0, math.copysign(min(max(2.0 * abs(err), TURN_RATE / 4), TURN_RATE), err)) # Never too slow to turn
+
+        elif self.state == "GATE": # Line up with the gap (sideways only, starting heading held) and drive through
+            if max(left, right) < ROBOT_WIDTH / 2: # Between the gate's edges: keep centred, straight on
+                self.in_gate = True
+                self.go(self.stop_speed(self.free_ahead(), self.cruise / 2), self.slide_speed((left - right) / 2))
+                return
+            if self.in_gate: # Out the other side
+                self.watch = []
+                self.set_state("MOVERS", "Through the gate: watching for the moving obstacles")
+                return
+            offset, wall = self.gate_offset()
+            if offset is None or not (-right <= offset <= left): # Not seen (or not reachable) yet: keep going
+                self.go(self.stop_speed(self.free_ahead() - ROBOT_LENGTH, self.cruise), self.slide_speed(self.lane_offset(look)))
+                return
+            aligned = abs(offset) < MARGIN / 4
+            forward = self.free_ahead() if aligned else self.free_ahead() - ROBOT_LENGTH / 2 # Not lined up: stop short of the wall
+            self.go(self.stop_speed(forward, self.cruise / 2), 0.0 if aligned else self.slide_speed(offset))
+
+        elif self.state == "MOVERS": # Starting heading held: only forward, left and right from here
+            seen = self.obstacle_ahead()
+            if seen is None: # Nothing ahead
+                self.go(self.stop_speed(self.free_ahead(), self.cruise), 0.0)
+                return
+            line, lo, hi = seen
+            if line > 2 * MARGIN: # Creep up to just short of its path first: less to cross
+                self.watch = []
+                self.go(self.stop_speed(line - MARGIN, self.cruise / 2), 0.0)
+                return
+            self.go(0.0, 0.0) # Stand still and watch it
+            if abs(self.vx) > 0.02 or abs(self.vy) > 0.02:
+                return
+            self.watch = [w for w in self.watch if self.now - w[0] < 1.0] + [(self.now, (lo + hi) / 2)]
+            t, centre = np.array(self.watch).T
+            if np.ptp(t) < 0.8:
+                return
+            if np.ptp(centre) < MARGIN: # Not moving: a static obstacle, slide round it
+                self.go(self.stop_speed(self.free_ahead(), self.cruise / 2), self.slide_speed(self.lane_offset(line + ROBOT_LENGTH)))
+                return
+            v = float(np.polyfit(t - t[0], centre, 1)[0])
+            band = ROBOT_WIDTH / 2 + 2 * MARGIN # Half the robot's lane
+            going = 1 if v > 0 else -1 # The side it is swinging to
+            lead, trail = (hi, lo) if going > 0 else (-lo, -hi) # Its edges, measured towards that side
+            wall = self.side_room(going) + ROBOT_WIDTH / 2 + MARGIN # Where it must turn round, at the latest
+            back_in = (2 * max(wall - lead, 0.0) + trail - band) / abs(v) # Until it is back in the lane
+            distance = line + ROBOT_LENGTH + 2 * MARGIN # Until the body is past its path
+            need = self.dash_time(distance, self.dash_speed, 2 * ACCEL)
+            if trail > band and back_in > need + 2 * MARGIN / abs(v): # Out of the lane, leaving, and can't be back in time
+                self.slide = (-going, across, min(self.side_room(-going), ROBOT_WIDTH / 2))
+                self.dash_to = along + distance
+                self.set_state("DASH", f"Moving obstacle swinging {'left' if going > 0 else 'right'} at {abs(v):.2f} m/s "
+                                       f"is clear for {back_in:.1f} s ({need:.1f} s needed): going, sliding "
+                                       f"{'right' if going > 0 else 'left'} away from it")
+
+        elif self.state == "DASH": # Straight past the obstacle's line, braking for anything in the way
+            if self.dash_to - along < 0.01:
+                self.crossed += 1
+                if self.crossed >= 2:
+                    self.move_2D(0.0, 0.0, 0.0)
+                    self.set_state("DONE", f"SUCCESS: past both moving obstacles in {self.now - self.t_start:.1f} s")
+                    return
+                self.watch = []
+                self.set_state("MOVERS", "Past moving obstacle 1: watching for the next")
+                return
+            room = min(self.free_ahead(), self.dash_to - along) # Stops just past it: the next one may be close behind
+            side, start, goal = self.slide # Sliding away from where it went, as it goes
+            moved = abs(across - start)
+            slide = side * self.stop_speed(min(goal - moved, self.side_room(side)), self.cruise / 2) if moved < goal else 0.0
+            self.go(self.stop_speed(room, self.dash_speed, 2 * ACCEL), slide, accel=2 * ACCEL)
+
+        if self.now - self.t_log > 1.0:
             self.t_log = self.now
-            o = self.obstacle
-            seen = "" if o is None or o["x"] is None else \
-                f" | obstacle x={o['x']:.2f} y={o['y'][-1]:+.2f} v={o['v']:+.2f} goes {o['lo']:+.2f} to {o['hi']:+.2f}"
-            self.get_logger().info(f"{self.state:6s} pose ({self.cp[0]:+.2f}, {self.cp[1]:+.2f}, {self.cp[2]:+6.1f}) "
-                                   f"v={self.speed:.2f}{seen}")
+            self.get_logger().info(f"{self.state} leg {self.leg + 1} pose ({self.pose[0]:+.2f}, {self.pose[1]:+.2f}, "
+                                   f"{self.pose[2]:+5.0f}) speed ({self.vx:+.2f}, {self.vy:+.2f}) ahead {min(self.free_ahead(), 9.9):.2f}")
         ###### INSERT CODE HERE ######
                 
 
