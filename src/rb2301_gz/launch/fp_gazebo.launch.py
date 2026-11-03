@@ -1,6 +1,6 @@
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
+from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, ExecuteProcess
 from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -34,8 +34,13 @@ def generate_launch_description():
     # for loading the model
     env_gz = SetEnvironmentVariable("GAZEBO_MODEL_PATH", pkg_rb2301_gz)
     ld.add_action(env_gz)
-    env_lib_gl = SetEnvironmentVariable("LIBGL_ALWAYS_SOFTWARE", "0") # 1 for VBox Users, 0 for non-Vbox users
-    ld.add_action(env_lib_gl) # FOR VBOX USERS
+    # Software rendering (Mesa llvmpipe) for VMs without a GL 3.3 driver (UTM/QEMU on Apple Silicon), as in CA1.
+    # Don't use LIBGL_ALWAYS_SOFTWARE=1: on Mesa 25 it segfaults inside OGRE-Next's EGL device enumeration.
+    # Comment out the kms_swrast override on a machine with a real GPU.
+    env_lib_gl = SetEnvironmentVariable("LIBGL_ALWAYS_SOFTWARE", "0")
+    ld.add_action(env_lib_gl)
+    env_mesa = SetEnvironmentVariable("MESA_LOADER_DRIVER_OVERRIDE", "kms_swrast")
+    ld.add_action(env_mesa)
 
     # world
     arg_world = DeclareLaunchArgument(
@@ -136,6 +141,16 @@ def generate_launch_description():
         ]
     )
     ld.add_action(gz_bridge_node)
+
+    # Bird's-eye view: once the Gazebo window is up, move its camera straight above the course, looking down, with
+    # +x to the right and +y up (as in plan.md). Retries until the window's /gui/move_to/pose service answers
+    birds_eye = (
+        'for i in $(seq 60); do '
+        'gz service -s /gui/move_to/pose --reqtype gz.msgs.GUICamera --reptype gz.msgs.Boolean --timeout 2000 '
+        '--req "pose: {position: {x: 2.4, y: -1.6, z: 2.5}, orientation: {w: 0.5, x: -0.5, y: 0.5, z: 0.5}}" '
+        '| grep -q "data: true" && exit 0; sleep 2; done'
+    )
+    ld.add_action(ExecuteProcess(cmd=['bash', '-c', birds_eye], output='log'))
 
     # # rviz
     # node_rviz = Node(

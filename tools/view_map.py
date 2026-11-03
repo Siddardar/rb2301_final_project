@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Show the maps that obstacle_course.py saves: the snapshots it saves once a second with --snapshots, and
-fp_map.npz, which it saves on exit.
+Show the maps that obstacle_course.py saves once a second with --snapshots (and once more on exit).
 
 No ROS needed, only numpy and matplotlib. To install them on your laptop:
 
@@ -13,12 +12,12 @@ a run afterwards:
 
     .venv/bin/python3 tools/view_map.py maps/<session>                  # step through all of a run's snapshots
     .venv/bin/python3 tools/view_map.py maps/<session>/map_000420.npz   # start at one snapshot
-    .venv/bin/python3 tools/view_map.py fp_map.npz                      # the map saved on exit
 
 Left and right arrow keys step through the snapshots. On the newest one, the view follows new snapshots as they come.
 
-Grey is the occupancy map: white free, black occupied, mid grey unknown. Orange is the sweep zone, where moving
-obstacles have been, and red is where the last two scans saw one, as the crossing rule uses it.
+Everything is in the start frame: the robot starts at (0, 0) facing +x. White is free, black occupied, grey unknown.
+The red dashed line is the right wall's line, and the green bar on it is the opening (the right turn). The star is
+the waypoint, the blue line the planned path, and the cyan box the robot's body.
 """
 import argparse
 import glob
@@ -28,10 +27,8 @@ import subprocess
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
 
 ROBOT_LENGTH, ROBOT_WIDTH = 0.289, 0.225 # m, as in obstacle_course.py
-SWEEP_COLOUR, MOVING_COLOUR = (1.0, 0.7, 0.3), (0.85, 0.1, 0.1)
 
 
 class View:
@@ -46,24 +43,23 @@ class View:
         self.target, = ax.plot([], [], marker="*", ms=16, color="tab:green", ls="none")
         self.robot, = ax.plot([], [], color="tab:cyan", lw=2)
         self.heading, = ax.plot([], [], color="tab:cyan", lw=2)
+        self.wall, = ax.plot([], [], color="tab:red", lw=1, ls="--")
+        self.opening, = ax.plot([], [], color="tab:green", lw=5, solid_capstyle="butt")
         ax.set_aspect("equal")
         ax.set_xlabel("x (m)")
         ax.set_ylabel("y (m)")
-        ax.legend(handles=[Patch(color=SWEEP_COLOUR, label="sweep zone"), Patch(color=MOVING_COLOUR, label="moving now"),
+        ax.legend(handles=[Line2D([], [], color="tab:red", lw=1, ls="--", label="right wall"),
+                           Line2D([], [], color="tab:green", lw=5, label="opening"),
                            Line2D([], [], color="tab:blue", lw=2, label="path"),
-                           Line2D([], [], marker="*", ms=12, color="tab:green", ls="none", label="target"),
+                           Line2D([], [], marker="*", ms=12, color="tab:green", ls="none", label="waypoint"),
                            Line2D([], [], color="tab:cyan", lw=2, label="robot"),
                            Line2D([], [], color="tab:purple", lw=1, label="trail"),
                            Line2D([], [], color="tab:gray", lw=1, ls="--", label="start line")],
                   loc="upper left", fontsize="small", framealpha=0.8)
 
     def show(self, snap, title:str):
-        occupancy = snap["occupancy"].astype(float)
-        dynamic = snap["dynamic"]
-        image = np.repeat((0.5 - occupancy / 8)[:, :, None], 3, axis=2) # log-odds -4 (free) to 4 (occupied): white to black
-        image[dynamic >= 0] = SWEEP_COLOUR
-        if "scan_count" in snap:
-            image[dynamic >= int(snap["scan_count"]) - 1] = MOVING_COLOUR
+        occupancy = snap["occupancy"].astype(float) # 1 occupied, 0 unknown, -1 free
+        image = np.repeat((0.5 - occupancy / 2)[:, :, None], 3, axis=2) # free white, unknown grey, occupied black
         rows, cols = occupancy.shape
         (x0, y0), cell = snap["origin"], float(snap["cell_size"])
         self.image.set_data(image)
@@ -71,10 +67,14 @@ class View:
 
         trail = snap["trail"]
         self.trail.set_data(trail[:, 0], trail[:, 1])
-        if "pose" in snap: # fp_map.npz from before snapshots were added has the map and trail only
+        wall_y, opening = float(snap["wall_y"]), snap["opening"]
+        self.wall.set_data(*(([x0, x0 + cols * cell], [wall_y, wall_y]) if np.isfinite(wall_y) else ([], [])))
+        self.opening.set_data(*((opening, [wall_y, wall_y]) if np.all(np.isfinite(opening)) else ([], [])))
+        if "pose" in snap:
             path, target = snap["path"], snap["target"]
             self.path.set_data(path[:, 0], path[:, 1])
-            self.target.set_data(*(([target[0]], [target[1]]) if np.all(np.isfinite(target)) else ([], [])))
+            self.target.set_data(*(([target[0]], [target[1] if np.isfinite(target[1]) else y0 + rows * cell / 2])
+                                   if np.isfinite(target[0]) else ([], [])))
             x, y, heading = snap["pose"]
             c, s = math.cos(math.radians(heading)), math.sin(math.radians(heading))
             corners = np.array([(1, 1), (-1, 1), (-1, -1), (1, -1), (1, 1)]) * (ROBOT_LENGTH / 2, ROBOT_WIDTH / 2)
