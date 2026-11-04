@@ -3,8 +3,6 @@ import configparser
 import heapq
 import math
 import os
-import subprocess
-import threading
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -73,8 +71,9 @@ MARGIN = 0.05 # m kept clear on each side of the body
 CELL = 0.025 # m, map resolution
 GROW = 1.0 # m of unknown border added on a side when the map grows
 AHEAD = 1.0 # m: before a waypoint is known, the goal is any cell this much further along the wanted direction
-WINDOW = 5.0 # deg either side of straight ahead / straight right (start frame) for the beams used to find the turn
-JUMP = 2.0 # a beam straight right reaching this many times further right than anything on the first scan: the turn
+WINDOW = 5.0 # deg either side of straight ahead / straight right (start frame) for the beams that measure the walls
+OCC_WEIGHT = 4 # a cell is occupied while hits * OCC_WEIGHT > passes: a wall seen at a shallow angle (beams skimming
+               # along it) stays occupied, a stray hit in open space still clears
 HEADING_TOL = 45.0 # deg: through the turn / door and this close to its direction counts as done
 STUCK_TIME, STUCK_DIST = 3.0, 0.05 # s, m: moving less than this in this long means stuck
 INFLATE = ROBOT_WIDTH / 2 + MARGIN # m: occupied cells are grown by this; the body centre stays outside
@@ -84,7 +83,7 @@ PATH_LOOKAHEAD = 0.25 # m, pure pursuit along the A* path (shorter than LOOKAHEA
 
 class Grid:
     '''Map in the start frame that grows when a scan reaches outside it. Each cell counts beams that ended in it (hits)
-    and went through it (passes); occupied if hits > passes. Indexed [row (y), col (x)]'''
+    and went through it (passes); occupied if hits * OCC_WEIGHT > passes. Indexed [row (y), col (x)]'''
     def __init__(self, x, y):
         self.x0, self.y0 = x - GROW, y - GROW # start-frame position of cell [0, 0]'s corner
         n = int(round(2 * GROW / CELL))
@@ -126,7 +125,7 @@ class Grid:
 
     def grown(self, radius):
         '''Occupied cells grown by radius (m)'''
-        occupied = self.hits > self.passes
+        occupied = self.hits * OCC_WEIGHT > self.passes
         rows, cols = np.nonzero(occupied)
         out = np.zeros_like(occupied)
         k = int(math.ceil(radius / CELL))
@@ -195,7 +194,7 @@ class LidarNode(Node):
 
 class ObstacleCourseNode(Node):
     '''Node to navigate obstacle course, using pose from either gazebo odometer or optitrack and lidar scan data'''
-    def __init__(self, is_simulation:bool=True, calibrate:bool=False):
+    def __init__(self, is_simulation:bool=True, calibrate:bool=False, snapshots:str=None):
         super().__init__('obstaclecourse')
         self.get_logger().info("Starting ObstacleCourseNode")
 
@@ -241,17 +240,22 @@ class ObstacleCourseNode(Node):
         self.path = None # (x, y) points to follow, from A*
         self.section = 1
         # Section 1: the right turn
-        self.reach = None # how far right anything reached on the first scan (start frame), normally the right wall
-        self.end_x = -math.inf # furthest x reached straight ahead so far: the end wall (obstacles are always nearer)
-        self.corner_x = None # x of the first beam straight right that passed the jump test: the turn's near corner
-        self.right_hits = [] # y of every hit by a beam straight right, before the turn is found
-        self.wall_y = None # the right wall's line: the median of right_hits, set when the turn is found
+        self.right_hits = [] # y of every hit by a beam straight right, in section 1
+        self.end_x = -math.inf # furthest x reached straight ahead in section 1: the first corridor's end wall, which
+                               # carries on as the new corridor's left wall (obstacles are always nearer)
+        self.wall_y = None # the right wall's line: the median of right_hits
         # Section 2: the door
         self.door = None # (centre x, centre y, direction through it as a unit vector x, y), start frame
-        self.door_locked = False # within LOOKAHEAD of the door's line: stop updating it, drive straight through
+        self.door_locked = False # at the line-up point: stop updating it, drive straight through
+        self.rejected = [] # centres of doors with no path to them: ignore notches near these
         self.last_move = None # (time, x, y) when the robot last moved STUCK_DIST
-        self.shown = None # waypoint last drawn in Gazebo
-        self.drawing = False # a `gz service` call to draw it is running
+        # Map snapshots for tools/view_map.py (--snapshots DIR)
+        self.snapshots = snapshots
+        if snapshots:
+            os.makedirs(snapshots, exist_ok=True)
+        self.trail = [] # body centre (x, y, heading) every tick, start frame
+        self.scan_count = 0
+        self.snapshot_ticks = 0
 
     def sub_scan_callback(self, msg):
         """Scan subscriber"""
@@ -260,8 +264,11 @@ class ObstacleCourseNode(Node):
         if len(ranges) > 360:
             ranges, angles = ranges[::2], angles[::2]
         self.last_scan = ranges
-        if self.pose is None or self.start is None or self.calibrate:
+        if self.pose is None:
             return
+        if self.start is None:
+            self.start = np.array(self.pose, dtype=float)
+        self.scan_count += 1
         valid = np.isfinite(ranges) & (ranges > msg.range_min)
         x, y, heading = self.start_frame()
         h = math.radians(heading)
@@ -273,95 +280,122 @@ class ObstacleCourseNode(Node):
             self.grid = Grid(lx, ly)
         self.grid.add_scan(lx, ly, ex, ey, ranges[valid])
 
-        if self.reach is None: # first scan: how far right anything reaches
-            self.reach = float(-ey.min())
-            self.get_logger().info(f"Furthest right on the first scan: {self.reach:.3f} m")
         if self.section == 2:
             self.find_door(ex, ey, a)
-        else: # section 1: find the turn's two edges
-            direction = np.degrees(a) % 360 # beam directions in the start frame, 0 = straight ahead
+        elif abs(heading) < HEADING_TOL: # section 1, still driving along the first corridor: the right wall's line,
+            # from the beams straight right. Most of them hit the wall; hits on obstacles beside the robot, or on things
+            # seen through the opening, are too few to move the median. Not once turning into the opening: then
+            # "straight right" points down the new corridor
+            direction = np.degrees(a) % 360
+            right = abs(direction - 270) <= WINDOW
+            self.right_hits.extend(ey[right].tolist())
             ahead = (direction <= WINDOW) | (direction >= 360 - WINDOW)
             if ahead.any():
                 self.end_x = max(self.end_x, float(ex[ahead].max()))
-            right = abs(direction - 270) <= WINDOW
-            far_right = right & (ey < -JUMP * self.reach)
-            if self.corner_x is None:
-                self.right_hits.extend(ey[right & ~far_right].tolist())
-            if far_right.any() and self.corner_x is None:
-                self.corner_x = float(ex[far_right].min())
-                # Most beams straight right hit the wall; hits on obstacles beside the robot, or on things seen through
-                # the opening just before the corner, are too few to move the median
+            if self.right_hits:
                 self.wall_y = float(np.median(self.right_hits))
-                self.get_logger().info(f"Right turn: corner at x = {self.corner_x:.2f}, end wall at x = {self.end_x:.2f}, "
-                                       f"right wall at y = {self.wall_y:.2f}")
-        self.replan()
+        if not self.calibrate: # calibration mode: map only, never plan or drive
+            self.replan()
 
     def replan(self):
         '''A* on the map from the body centre to the current goal (a-star.md). No path: stop'''
         if self.section == 2 and self.door_locked:
             return # straight through the door along its centre line, no A*
+        if self.wall_y is None:
+            return
         bx, by, _ = self.body()
-        goal, radius, direction, distance = None, 0.0, (0.0, -1.0), AHEAD # default: AHEAD further down the new corridor
-        if self.section == 1 and self.corner_x is None:
-            direction = (1.0, 0.0) # AHEAD further along the first corridor
-        elif self.section == 1: # turn found: any cell AHEAD below the right wall's line (the scan waypoint is only the
-            distance = by - (self.wall_y - AHEAD) # handover marker; A* finds its own way through the opening)
-        elif self.door is not None:
-            cx, cy, nx, ny = self.door # near the line-up point in front of the door
-            goal, radius = (cx - LOOKAHEAD * nx, cy - LOOKAHEAD * ny), MARGIN
         start = tuple(int(v) for v in self.grid.cell(bx, by))
         blocked, near = self.grid.blocked(bx, by)
-        if goal is not None:
-            cells = astar(blocked, near, start, goal=tuple(int(v) for v in self.grid.cell(*goal)), radius=radius / CELL)
-        else:
-            cells = astar(blocked, near, start, direction=direction, distance=distance / CELL)
+        cells = None
+        if self.section == 2 and self.door is not None: # near the line-up point in front of the door
+            cx, cy, nx, ny = self.door
+            goal = tuple(int(v) for v in self.grid.cell(cx - LOOKAHEAD * nx, cy - LOOKAHEAD * ny))
+            cells = astar(blocked, near, start, goal=goal, radius=MARGIN / CELL)
+            if cells is None: # no way to this door: forget it and go back to the goal line
+                self.get_logger().info(f"No path to the door at ({cx:.2f}, {cy:.2f}): ignoring it")
+                self.rejected.append((cx, cy))
+                self.door = None
+        if cells is None:
+            # Goal line: section 1, any cell AHEAD below the right wall's line (only reachable through the right turn,
+            # which A* finds by itself); section 2, any cell AHEAD further down the corridor than the robot. The map
+            # only covers what's been seen, so grow it (as unknown space) to include the goal line first
+            distance = by - (self.wall_y - AHEAD) if self.section == 1 else AHEAD
+            rows_before, x0, y0 = self.grid.hits.shape, self.grid.x0, self.grid.y0
+            self.grid.fit(np.array([bx]), np.array([by - distance - CELL]))
+            if self.grid.hits.shape != rows_before or (self.grid.x0, self.grid.y0) != (x0, y0):
+                start = tuple(int(v) for v in self.grid.cell(bx, by))
+                blocked, near = self.grid.blocked(bx, by)
+            cells = astar(blocked, near, start, direction=(0.0, -1.0), distance=distance / CELL)
         if cells is None:
             self.finish("No path")
         self.path = np.array([self.grid.centre(r, c) for r, c in cells])
 
     def find_door(self, ex, ey, a):
         '''Section 2: the door is a notch in the left wall, a run of beams reaching more than ROBOT_LENGTH further left
-        than the beams either side of it (the posts), with both posts on the left wall and far enough apart for the
-        robot plus margins. A set-back wall (the
-        simulation) is only a step up, never a notch, so the same test works whether or not the door is flush'''
+        than the beams either side of it (the posts). A door's posts are ends of a wall: in the map, the wall carries on
+        past each post, away from the door (an obstacle's edge doesn't). The posts are also on the same wall and far
+        enough apart for the robot plus margins. A set-back wall (the simulation) is only a step up, never a notch, so
+        the same test works whether or not the door is flush, and on a tilted course'''
         if self.door_locked:
             return
-        # The corridor's left wall: section 1's end wall carries on as the new corridor's left wall after a right turn.
-        # Measured as the furthest point straight ahead, so obstacles beside the robot can't pull it nearer
-        left_x = self.end_x
         direction = (np.degrees(a) + 180) % 360 - 180 # start frame, 0 = straight left of the corridor
         side = np.flatnonzero(abs(direction) < 90) # every beam pointing left, in angle order
         side = side[np.argsort(direction[side])]
         x, y = ex[side], ey[side]
         groups = np.split(np.arange(len(x)), np.flatnonzero(abs(np.diff(x)) > ROBOT_LENGTH) + 1)
         bx, by, _ = self.body()
-        best = None
+        doors = []
         for p in range(len(groups) - 2):
             post1 = groups[p][-1]
-            if x[post1] < left_x - MARGIN: # a post has to be on the left wall
-                continue
             for q in range(p + 1, len(groups)):
                 if x[groups[q]].min() > x[post1] + ROBOT_LENGTH: # still deeper than the first post: inside the notch
                     continue
                 post2 = groups[q][0]
                 inner = np.concatenate(groups[p + 1:q]) if q > p + 1 else np.array([], int)
                 # Both posts on the same wall (the corridor's end can hide a post from upstream, and then pair with
-                # the far one), and the notch deeper than both
-                # ... and the posts far enough apart for the robot plus margins (a gap between wall panels isn't a door)
-                if (len(inner) and x[post2] >= left_x - MARGIN and abs(x[post2] - x[post1]) <= ROBOT_LENGTH
+                # the far one), the notch deeper than both, the posts far enough apart for the robot plus margins (a
+                # gap between wall panels isn't a door), and the wall carrying on past each post (not an obstacle)
+                # ... and both posts near the new corridor's left wall (within a robot length, which allows for a
+                # course tilted a few degrees): not a gap between obstacles out in the corridor
+                if (len(inner) and abs(x[post2] - x[post1]) <= ROBOT_LENGTH
+                        and min(x[post1], x[post2]) >= self.end_x - ROBOT_LENGTH
                         and x[inner].min() > x[post2] + ROBOT_LENGTH
-                        and math.hypot(x[post2] - x[post1], y[post2] - y[post1]) >= ROBOT_WIDTH + 2 * MARGIN):
+                        and math.hypot(x[post2] - x[post1], y[post2] - y[post1]) >= ROBOT_WIDTH + 2 * MARGIN
+                        and self.wall_continues(x[post1], y[post1], x[post2], y[post2])
+                        and self.wall_continues(x[post2], y[post2], x[post1], y[post1])):
                     cx, cy = (x[post1] + x[post2]) / 2, (y[post1] + y[post2]) / 2
                     nx, ny = y[post2] - y[post1], -(x[post2] - x[post1]) # perpendicular to the posts' line
                     norm = math.hypot(nx, ny)
                     nx, ny = (nx, ny) if (cx - bx) * nx + (cy - by) * ny > 0 else (-nx, -ny) # away from the robot
-                    if best is None or math.hypot(cx - bx, cy - by) < math.hypot(best[0] - bx, best[1] - by):
-                        best = (cx, cy, nx / norm, ny / norm)
+                    doors.append((cx, cy, nx / norm, ny / norm))
                 break
-        if best is not None:
-            if self.door is None:
-                self.get_logger().info(f"Door at ({best[0]:.2f}, {best[1]:.2f}), left wall at x = {left_x:.2f}")
+        # The door is in the left wall, so it points roughly left (0 deg); skip doors already found to have no path
+        doors = [d for d in doors if abs(math.degrees(math.atan2(d[3], d[2]))) < HEADING_TOL
+                 and all(math.hypot(d[0] - rx, d[1] - ry) > LOOKAHEAD for rx, ry in self.rejected)]
+        if self.door is not None:
+            doors.append(self.door) # keep the current one unless a door closer to the goal line turns up
+        if doors:
+            best = min(doors, key=lambda d: d[1]) # closest to the goal line: furthest down the corridor
+            if self.door is None or math.hypot(best[0] - self.door[0], best[1] - self.door[1]) > LOOKAHEAD:
+                self.get_logger().info(f"Door at ({best[0]:.2f}, {best[1]:.2f})")
             self.door = best
+
+    def wall_continues(self, px, py, ox, oy):
+        '''Does the map show wall carrying on from the post (px, py), away from the other post (ox, oy), along their
+        line? Samples every cell out to 2 * MARGIN, allowing one cell either side; most must be occupied'''
+        d = math.hypot(px - ox, py - oy)
+        ux, uy = (px - ox) / d, (py - oy) / d # outward along the posts' line
+        occupied = self.grid.hits * OCC_WEIGHT > self.grid.passes
+        rows, cols = occupied.shape
+        steps = np.arange(1, int(round(2 * MARGIN / CELL)) + 1)
+        found = 0
+        for k in steps:
+            hit = False
+            for j in (-1, 0, 1): # one cell either side of the line
+                r, c = self.grid.cell(px + k * CELL * ux - j * CELL * uy, py + k * CELL * uy + j * CELL * ux)
+                hit = hit or (0 <= r < rows and 0 <= c < cols and occupied[r, c])
+            found += hit
+        return found > len(steps) / 2
 
     def start_frame(self):
         '''Pose in the start frame'''
@@ -375,36 +409,26 @@ class ObstacleCourseNode(Node):
         x, y, heading = self.start_frame()
         return x + BODY_X * math.cos(math.radians(heading)), y + BODY_X * math.sin(math.radians(heading)), heading
 
-    def waypoint(self):
-        '''Middle of the right turn: halfway between its near corner and the end wall, on the right wall's line'''
-        return None if self.corner_x is None else ((self.corner_x + self.end_x) / 2, self.wall_y)
-
-    def show_waypoint(self, waypoint):
-        '''Simulation only, for watching: draw the waypoint as a green sphere just above the walls in the Gazebo
-        window, which the launch file sets to a bird's-eye view (Gazebo's /marker
-        service). Runs `gz service` in the background, one call at a time, so the controller never waits for it.
-        Each call takes about a second (it starts the gz tool), and `gz service` reports success even on a timeout'''
-        if not self.is_simulation or waypoint is None or self.drawing:
+    def save_snapshot(self):
+        '''Save the map and the robot's state for tools/view_map.py: map_<scan>.npz in the --snapshots directory,
+        written to a .tmp file first so the viewer never copies half a file'''
+        if not self.snapshots or self.grid is None:
             return
-        if self.shown is not None and math.hypot(waypoint[0] - self.shown[0], waypoint[1] - self.shown[1]) < 0.02:
-            return
-        self.shown = waypoint
-        x0, y0, h0 = self.start # start frame -> Gazebo's world frame (the odometry's frame)
-        c, s = math.cos(math.radians(h0)), math.sin(math.radians(h0))
-        wx, wy = x0 + c * waypoint[0] - s * waypoint[1], y0 + s * waypoint[0] + c * waypoint[1]
-        green = "{r: 0, g: 1, b: 0, a: 1}"
-        req = (f'action: ADD_MODIFY, ns: "waypoint", id: 1, type: SPHERE, scale: {{x: 0.2, y: 0.2, z: 0.2}}, '
-               f'pose: {{position: {{x: {wx}, y: {wy}, z: 0.6}}}}, material: {{ambient: {green}, diffuse: {green}}}') # just above the walls
-        cmd = ["gz", "service", "-s", "/marker", "--reqtype", "gz.msgs.Marker", "--reptype", "gz.msgs.Empty",
-               "--timeout", "3000", "--req", req]
-        def run():
-            out = subprocess.run(cmd, capture_output=True, text=True)
-            if out.returncode != 0 or "timed out" in out.stdout + out.stderr:
-                self.get_logger().warn("Couldn't draw the waypoint in Gazebo (gz service /marker)")
-                self.shown = None # try again next tick
-            self.drawing = False
-        self.drawing = True
-        threading.Thread(target=run, daemon=True).start()
+        g = self.grid
+        occupied = g.hits * OCC_WEIGHT > g.passes
+        occupancy = np.where(occupied, 1, np.where(g.passes > 0, -1, 0)).astype(np.int8) # 1 occupied, -1 free, 0 unknown
+        name = os.path.join(self.snapshots, f"map_{self.scan_count:06d}.npz")
+        state = "calibrate" if self.calibrate else f"section {self.section}" + (", door locked" if self.door_locked else "")
+        with open(name + ".tmp", "wb") as f:
+            np.savez_compressed(f, occupancy=occupancy, origin=np.array((g.x0, g.y0)), cell_size=CELL,
+                                pose=np.array(self.body() if self.start is not None else (np.nan,) * 3),
+                                start=np.zeros(3), trail=np.array(self.trail, dtype=float).reshape(-1, 3),
+                                path=np.zeros((0, 2)) if self.path is None else self.path,
+                                target=self.path[-1] if self.path is not None else np.full(2, np.nan),
+                                wall_y=np.nan if self.wall_y is None else self.wall_y,
+                                door=np.full(4, np.nan) if self.door is None else np.array(self.door),
+                                state=state, scan_count=self.scan_count)
+        os.replace(name + ".tmp", name)
 
     def finish(self, reason):
         self.move_2D(0.0, 0.0, 0.0)
@@ -413,11 +437,13 @@ class ObstacleCourseNode(Node):
 
     def steer(self, cx, cy, lookahead):
         '''Pure pursuit toward (cx, cy), about lookahead away: turn on the arc through it, slower the further off it
-        is; turn in place if it's behind'''
+        is; turn in place if it's behind. The robot turns about its body centre, not its pose (rear axle): a small
+        sideways velocity of -turn * BODY_X keeps the body centre where A* planned it, so turning on the spot doesn't
+        swing the front of the body sideways'''
         bx, by, heading = self.body()
         alpha = math.radians(wrap_deg(math.degrees(math.atan2(cy - by, cx - bx)) - heading))
-        self.move_2D(SPEED * max(math.cos(alpha), 0.0), 0.0,
-                     2 * SPEED * (math.sin(alpha) if abs(alpha) <= math.pi / 2 else math.copysign(1.0, alpha)) / lookahead)
+        turn = 2 * SPEED * (math.sin(alpha) if abs(alpha) <= math.pi / 2 else math.copysign(1.0, alpha)) / lookahead
+        self.move_2D(SPEED * max(math.cos(alpha), 0.0), -turn * BODY_X, turn)
 
     def yaw_from_quaternion(self, q):
         '''Returns yaw angle (in rad) for orientation based on given quaternion input q'''
@@ -464,6 +490,12 @@ class ObstacleCourseNode(Node):
             print("No pose detected")
             return # Does not run if no pose received from Odom or Optitrack
 
+        if self.snapshots and self.start is not None: # map snapshots for tools/view_map.py, once a second
+            self.trail.append(tuple(self.body()))
+            self.snapshot_ticks += 1
+            if self.snapshot_ticks % 20 == 0:
+                self.save_snapshot()
+
         if self.calibrate and self.raw_pose is not None:
             self._ticks += 1
             if self._ticks % 10 == 0: # twice a second
@@ -484,19 +516,18 @@ class ObstacleCourseNode(Node):
             self.finish("Stuck")
 
         if self.section == 1:
-            self.show_waypoint(self.waypoint()) # the handover marker
-            if self.corner_x is not None and by < self.wall_y and abs(wrap_deg(heading + 90)) < HEADING_TOL:
+            if by < self.wall_y and abs(wrap_deg(heading + 90)) < HEADING_TOL:
                 self.get_logger().info("Section 1 done: through the right turn, heading down the new corridor")
                 self.section = 2
         elif self.door is not None:
             cx, cy, nx, ny = self.door
-            self.show_waypoint((cx, cy))
+            lx, ly = cx - LOOKAHEAD * nx, cy - LOOKAHEAD * ny # line-up point
             through = math.degrees(math.atan2(ny, nx)) # direction through the door
             along = (bx - cx) * nx + (by - cy) * ny # how far past the door's line (negative: before it)
             # done once the whole body (plus MARGIN) is past the door's line
             if along > ROBOT_LENGTH / 2 + MARGIN and abs(wrap_deg(heading - through)) < HEADING_TOL:
                 self.finish("Section 2 done: through the door")
-            if not self.door_locked and along > -(LOOKAHEAD + MARGIN): # at the line-up point (A*'s goal area) or past it
+            if not self.door_locked and math.hypot(bx - lx, by - ly) < 2 * MARGIN: # at the line-up point
                 self.door_locked = True
                 self.get_logger().info(f"Door locked at ({cx:.2f}, {cy:.2f}), heading through it {through:.0f} deg")
             if self.door_locked: # pure pursuit along the door's centre line, LOOKAHEAD past the robot's projection
@@ -514,6 +545,7 @@ class ObstacleCourseNode(Node):
 def main(args=None):
     arg_parser = argparse.ArgumentParser(description="RB2301 final project")
     arg_parser.add_argument('--calibrate', action='store_true', help="Real robot: only print the Optitrack pose and the maze-frame pose twice a second, never drive")
+    arg_parser.add_argument('--snapshots', metavar='DIR', help="Save a map snapshot to DIR once a second, for tools/view_map.py")
     cli_args, ros_args = arg_parser.parse_known_args(args=args)
     print("Starting obstacle course")
     rclpy.init(args=ros_args)
@@ -526,7 +558,7 @@ def main(args=None):
     lidar.destroy_node()
 
     # Start spinning the obstacle node and only stop once SystemExit error is raised within the node callback
-    obstacle = ObstacleCourseNode(is_simulation, cli_args.calibrate)
+    obstacle = ObstacleCourseNode(is_simulation, cli_args.calibrate, cli_args.snapshots)
     try:
         rclpy.spin(obstacle)
     except (SystemExit, KeyboardInterrupt):
@@ -535,6 +567,7 @@ def main(args=None):
         obstacle.move_2D(0.0, 0.0, 0.0) # Gazebo keeps the last velocity
     except Exception:
         pass
+    obstacle.save_snapshot() # the final state, for tools/view_map.py
     obstacle.destroy_node()
     if rclpy.ok():
         rclpy.shutdown()

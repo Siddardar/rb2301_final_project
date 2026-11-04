@@ -38,6 +38,27 @@ disagree in gaps only a few centimetres wider than the robot.
 - **Follow the path without turning near obstacles.** Translate along the path
   when an obstacle is within the turning circle, and only turn in open space.
 
+### Door frame clearance since turning about the body centre
+
+**The issue.** The robot now turns about its body centre: a sideways velocity of
+`-turn × BODY_X` keeps the body centre where A* planned it. That fixed a robot
+that spun about its rear axle into a drawer. But in the straight drive through
+the door, the back half of the body is still inside the door frame, and it now
+swings sideways as much as the front on every small heading correction. Door
+frame clearance dropped from about 3–4 cm to 0–2 cm, touching once (−0.1 cm).
+
+**Possible fix:** turn about the body centre only while following the A* path,
+and turn about the rear axle in the straight drive through the door, as before.
+
+### Grazing in gaps barely wider than the robot
+
+**The issue.** In one layout, the route went between a drawer in the mouth of
+the turn and a bin below it (a 44 cm gap), turning from −90° to −180° on the
+way. The robot cleared the drawer by 1.3 cm in one run and grazed it (0 cm) in
+the next. Inflating by half the robot's width doesn't protect the corners in a
+gap that tight, even when turning about the body centre. Same family as the
+contact issue above.
+
 ## Section 1
 
 ### Widest gap along the handover line

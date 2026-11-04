@@ -15,9 +15,11 @@ a run afterwards:
 
 Left and right arrow keys step through the snapshots. On the newest one, the view follows new snapshots as they come.
 
-Everything is in the start frame: the robot starts at (0, 0) facing +x. White is free, black occupied, grey unknown.
-The red dashed line is the right wall's line, and the green bar on it is the opening (the right turn). The star is
-the waypoint, the blue line the planned path, and the cyan box the robot's body.
+Everything is in the start frame: the robot starts at (0, 0) facing +x. White is free, black occupied, grey unknown
+(occupied means hits * OCC_WEIGHT > passes, as the planner uses it). The red dashed line is the right wall's line
+(section 1 is done once the robot is past it). The blue line is the A* path and the star its end, where the robot is
+heading. In section 2, the green bar is the door, the arrow points through it, and the small circle is the line-up
+point in front of it. The cyan box is the robot's body, and the purple line its trail.
 """
 import argparse
 import glob
@@ -44,14 +46,16 @@ class View:
         self.robot, = ax.plot([], [], color="tab:cyan", lw=2)
         self.heading, = ax.plot([], [], color="tab:cyan", lw=2)
         self.wall, = ax.plot([], [], color="tab:red", lw=1, ls="--")
-        self.opening, = ax.plot([], [], color="tab:green", lw=5, solid_capstyle="butt")
+        self.door, = ax.plot([], [], color="tab:green", lw=5, solid_capstyle="butt")
+        self.through, = ax.plot([], [], color="tab:green", lw=1.5)
+        self.lineup, = ax.plot([], [], marker="o", ms=7, mfc="none", color="tab:green", ls="none")
         ax.set_aspect("equal")
         ax.set_xlabel("x (m)")
         ax.set_ylabel("y (m)")
         ax.legend(handles=[Line2D([], [], color="tab:red", lw=1, ls="--", label="right wall"),
-                           Line2D([], [], color="tab:green", lw=5, label="opening"),
-                           Line2D([], [], color="tab:blue", lw=2, label="path"),
-                           Line2D([], [], marker="*", ms=12, color="tab:green", ls="none", label="waypoint"),
+                           Line2D([], [], color="tab:green", lw=5, label="door"),
+                           Line2D([], [], color="tab:blue", lw=2, label="A* path"),
+                           Line2D([], [], marker="*", ms=12, color="tab:green", ls="none", label="path end"),
                            Line2D([], [], color="tab:cyan", lw=2, label="robot"),
                            Line2D([], [], color="tab:purple", lw=1, label="trail"),
                            Line2D([], [], color="tab:gray", lw=1, ls="--", label="start line")],
@@ -67,15 +71,24 @@ class View:
 
         trail = snap["trail"]
         self.trail.set_data(trail[:, 0], trail[:, 1])
-        wall_y, opening = float(snap["wall_y"]), snap["opening"]
+        wall_y = float(snap["wall_y"])
         self.wall.set_data(*(([x0, x0 + cols * cell], [wall_y, wall_y]) if np.isfinite(wall_y) else ([], [])))
-        self.opening.set_data(*((opening, [wall_y, wall_y]) if np.all(np.isfinite(opening)) else ([], [])))
+        door = snap["door"] if "door" in snap else np.full(4, np.nan)
+        if np.all(np.isfinite(door)):
+            cx, cy, nx, ny = door # centre, and the direction through it
+            self.door.set_data([cx - 0.2 * ny, cx + 0.2 * ny], [cy + 0.2 * nx, cy - 0.2 * nx]) # about 0.4 m wide
+            self.through.set_data([cx - 0.4 * nx, cx + 0.4 * nx], [cy - 0.4 * ny, cy + 0.4 * ny])
+            self.lineup.set_data([cx - 0.4 * nx], [cy - 0.4 * ny])
+        else:
+            for line in (self.door, self.through, self.lineup):
+                line.set_data([], [])
         if "pose" in snap:
             path, target = snap["path"], snap["target"]
             self.path.set_data(path[:, 0], path[:, 1])
-            self.target.set_data(*(([target[0]], [target[1] if np.isfinite(target[1]) else y0 + rows * cell / 2])
-                                   if np.isfinite(target[0]) else ([], [])))
+            self.target.set_data(*(([target[0]], [target[1]]) if np.all(np.isfinite(target)) else ([], [])))
             x, y, heading = snap["pose"]
+            if not np.isfinite(x):
+                x = y = heading = 0.0
             c, s = math.cos(math.radians(heading)), math.sin(math.radians(heading))
             corners = np.array([(1, 1), (-1, 1), (-1, -1), (1, -1), (1, 1)]) * (ROBOT_LENGTH / 2, ROBOT_WIDTH / 2)
             self.robot.set_data(x + corners[:, 0] * c - corners[:, 1] * s, y + corners[:, 0] * s + corners[:, 1] * c)

@@ -7,3 +7,5 @@ __pycache__/
 maps/
 .venv/
 fp_map.npz
+test_failures/
+tests/

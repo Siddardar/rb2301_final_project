@@ -73,6 +73,24 @@ three test cases. It's been removed; see `improvements.md`.
 
 There's no strafing.
 
+## Seeing the map
+
+With `--snapshots DIR`, the node saves `map_<scan>.npz` to `DIR` once a second,
+and once more on exit:
+
+- the map (occupied, free, unknown, using the same rule as the planner)
+- the A* path and its end
+- the right wall's line
+- the door (centre and direction)
+- the robot, its trail, and the section
+
+`tools/view_map.py` draws them. It needs only numpy and matplotlib, so it runs on
+the Mac. `./robot-test.sh NN --map` passes `--snapshots` on the robot, copies the
+snapshots to `maps/<session>` and shows them live.
+
+With `--calibrate`, the node now builds the map without planning or driving, so
+you can push the robot through the course by hand and watch the map form.
+
 ## Test results
 
 Three random layouts. The first try had no clearance cost, used `LOOKAHEAD` for
