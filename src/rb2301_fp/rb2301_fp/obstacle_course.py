@@ -86,7 +86,7 @@ UNKNOWN_COST = 2.0 # a step into a cell never seen costs this many times more, s
 PATH_LOOKAHEAD = 0.25 # m, pure pursuit along the A* path (shorter than LOOKAHEAD, so it cuts corners less)
 REPLAN_PERIOD = 0.5 # s between A* plans. Mapping still uses every scan; planning on every scan was too slow on the robot
 # Section 3 (no map, no A*): face 0 deg, slide to the left wall, then wait out each moving obstacle and dash past it
-OBSTACLE_GAP = 1.0 # robot widths: something in the robot's path this close to its front is a moving obstacle blocking it
+OBSTACLE_GAP = 1.5 # robot widths: something in the robot's path this close to its front is a moving obstacle blocking it
 DASH_SPEED = 0.4 # m/s past a moving obstacle (move_2D caps it at 0.3 on the real robot)
 MOVING_OBSTACLES = 2 # the course ends once the robot is past this many
 WALL_GAP = 0.10 # m between the body's left side and section 3's left wall, which the robot follows (room for drift)
@@ -241,7 +241,7 @@ class ObstacleCourseNode(Node):
         if is_simulation:
             self.max_translate_velocity = 1.4
         else:
-            self.max_translate_velocity = 0.3 # Please keep this in place; 0.3m/s is more than fast enough 
+            self.max_translate_velocity = 0.4 # Please keep this in place; 0.3m/s is more than fast enough 
 
         # Queue of 1: while the node is busy, only the newest scan waits. An older scan would be placed with the robot's
         # current pose, drawn rotated by however much the robot turned since (smeared walls)
