@@ -345,6 +345,38 @@ its own random angle about its centre.
 | Crooked ±5° | Done, 56 s |
 | Crooked ±8° | Done, 78 s, after the post-width rule and the gap-search turning rule |
 
+## Part 3: section 3, the moving obstacles
+
+Reactive only: no map and no A*. It starts when section 2 is done, and works
+from the latest scan, relative to the body.
+
+1. **Face 0°.** Turn in place, about the body centre, until the heading is
+   within `WINDOW` (5°) of the start heading.
+2. **Slide to the left wall.** Still facing 0°, slide left until the body's
+   left side is `MARGIN` from the wall. The wall is the median of the beams
+   within 5° of straight left, seen fresh, not the map's left wall line. The
+   slide slows near the wall, but never below a quarter of `SPEED`.
+3. **Each moving obstacle, `MOVING_OBSTACLES` (2) times:**
+   - **The path:** scan points ahead of the body's front, and within the body's
+     half-width sideways. Not wider, or the left wall `MARGIN` away would count.
+   - **Wait** in place until something in the path is within `OBSTACLE_GAP` (1.0)
+     robot widths of the front. That's the obstacle blocking. Then wait until the
+     path is free again: it has just gone by.
+   - **Dash** straight at `DASH_SPEED` (0.4 m/s), holding 0°, for the obstacle's
+     distance plus the robot's length plus `MARGIN`. The distance is the
+     furthest it was from the front while blocking. The obstacles are sheets of
+     cardboard, so their depth doesn't count. Then stop.
+4. **After the second dash,** the course is done: finish (hold still, or exit
+   with `--exit`).
+
+**Notes:**
+- `move_2D` caps speed at 0.3 m/s on the real robot, so the dash runs at
+  0.3 m/s there.
+- With `--exit` (the simulation tests, which cover sections 1 and 2), section 2
+  still finishes the run.
+- If the second obstacle's lane is more than one robot width ahead after the
+  first dash, it never counts as blocking, and the robot waits for good.
+
 ## The course map (reference only)
 
 All numbers are in the simulation's world frame, in metres. The robot spawns at

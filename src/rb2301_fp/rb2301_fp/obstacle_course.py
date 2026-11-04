@@ -56,6 +56,7 @@ def load_frame(robot_number:int) -> tuple:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# Section 3 (plan.md, Part 3) is reactive only: see section_3().
 # Sections 1 and 2 (plan.md, a-star.md): scan-based detection of the right turn and the door gives the waypoints; a map
 # that grows as the LiDAR sees more, and A* on it, get the robot to them. Everything is in the start frame: origin at the
 # start, +x the start heading, angles counter-clockwise. No constant describes the course.
@@ -84,6 +85,10 @@ CLEARANCE_COST = 3.0                 # so paths keep the full margin and more wh
 UNKNOWN_COST = 2.0 # a step into a cell never seen costs this many times more, so paths prefer space actually seen
 PATH_LOOKAHEAD = 0.25 # m, pure pursuit along the A* path (shorter than LOOKAHEAD, so it cuts corners less)
 REPLAN_PERIOD = 0.5 # s between A* plans. Mapping still uses every scan; planning on every scan was too slow on the robot
+# Section 3 (no map, no A*): face 0 deg, slide to the left wall, then wait out each moving obstacle and dash past it
+OBSTACLE_GAP = 1.0 # robot widths: something in the robot's path this close to its front is a moving obstacle blocking it
+DASH_SPEED = 0.4 # m/s past a moving obstacle (move_2D caps it at 0.3 on the real robot)
+MOVING_OBSTACLES = 2 # the course ends once the robot is past this many
 
 
 class Grid:
@@ -269,6 +274,11 @@ class ObstacleCourseNode(Node):
         self.door_locked = False # at the line-up point: stop updating it, drive straight through
         self.rejected = [] # centres of doors with no path to them: ignore notches near these
         self.last_move = None # (time, x, y) when the robot last moved STUCK_DIST
+        # Section 3: the moving obstacles
+        self.step3 = "face" # face (turn to 0 deg), wall (slide left to the wall), wait (for an obstacle), dash (past it)
+        self.passed = 0 # moving obstacles dashed past
+        self.gap = None # closest the current obstacle came to the front while blocking the path (m); None: not seen yet
+        self.dash = None # (start x, start y, distance) of the current dash
         # Map snapshots for tools/view_map.py (--snapshots DIR)
         self.snapshots = snapshots
         if snapshots:
@@ -315,7 +325,7 @@ class ObstacleCourseNode(Node):
 
         if self.section == 2:
             self.find_door(ex, ey, a)
-        elif abs(heading) < HEADING_TOL: # section 1, still driving along the first corridor: the right wall's line,
+        elif self.section == 1 and abs(heading) < HEADING_TOL: # section 1, still driving along the first corridor: the right wall's line,
             # from the beams straight right. Most of them hit the wall; hits on obstacles beside the robot, or on things
             # seen through the opening, are too few to move the median. Not once turning into the opening: then
             # "straight right" points down the new corridor
@@ -336,7 +346,7 @@ class ObstacleCourseNode(Node):
                 if old is None or abs(self.wall_y - old) > 0.02:
                     self.log(None, 0, f"Right wall's line y = {self.wall_y:.3f} (median of {len(self.right_hits)} hits "
                                       f"straight right); end wall x = {self.end_x:.3f}")
-        if not self.calibrate and time.monotonic() - self.last_plan >= REPLAN_PERIOD: # calibration mode: map only
+        if not self.calibrate and self.section < 3 and time.monotonic() - self.last_plan >= REPLAN_PERIOD: # calibration mode: map only
             self.last_plan = time.monotonic()
             self.replan()
 
@@ -507,7 +517,8 @@ class ObstacleCourseNode(Node):
         occupied = g.hits * OCC_WEIGHT > g.passes
         occupancy = np.where(occupied, 1, np.where(g.passes > 0, -1, 0)).astype(np.int8) # 1 occupied, -1 free, 0 unknown
         name = os.path.join(self.snapshots, f"map_{self.scan_count:06d}.npz")
-        state = "calibrate" if self.calibrate else f"section {self.section}" + (", door locked" if self.door_locked else "")
+        state = "calibrate" if self.calibrate else f"section {self.section}" + (", door locked" if self.door_locked else "") \
+                + (f", {self.step3}, {self.passed} passed" if self.section == 3 else "")
         with open(name + ".tmp", "wb") as f:
             np.savez_compressed(f, occupancy=occupancy, origin=np.array((g.x0, g.y0)), cell_size=CELL,
                                 pose=np.array(self.body() if self.start is not None else (np.nan,) * 3),
@@ -528,6 +539,95 @@ class ObstacleCourseNode(Node):
         if self.exit_on_finish:
             raise SystemExit
         self.halted = reason
+
+    def section_2_done(self, reason):
+        '''Through the door: on to section 3. With --exit (the simulation tests, which cover sections 1 and 2), finish'''
+        if self.exit_on_finish:
+            self.finish(reason)
+            return
+        self.get_logger().info(f"{reason}. Section 3: face 0 deg, slide to the left wall, then the moving obstacles")
+        self.move_2D(0.0, 0.0, 0.0)
+        self.section, self.path, self.door_locked = 3, None, False
+
+    def section_3(self, bx, by, heading):
+        '''The moving obstacles, reactively from the latest scan (no map): face 0 deg; slide left until the body is
+        MARGIN from the wall; then for each obstacle, wait until it blocks the path and the path is free again (it has
+        just gone by), and dash forward its distance plus the robot's length plus MARGIN. Done after MOVING_OBSTACLES'''
+        if self.points is None:
+            self.move_2D(0.0, 0.0, 0.0)
+            return
+        # Scan points relative to the body: fx forward, fy left
+        h = math.radians(heading)
+        dx, dy = self.points[:, 0] - bx, self.points[:, 1] - by
+        fx, fy = math.cos(h) * dx + math.sin(h) * dy, -math.sin(h) * dx + math.cos(h) * dy
+        turn = 2 * SPEED * math.sin(math.radians(-heading)) / LOOKAHEAD # hold 0 deg, as pure pursuit would
+
+        if self.step3 == "face": # turn in place (about the body centre) to the start heading
+            if abs(heading) > WINDOW:
+                turn = math.copysign(max(abs(turn), 0.5 * SPEED / LOOKAHEAD), turn) # don't creep at the end
+                self.move_2D(0.0, -turn * BODY_X, turn)
+                self.log("s3", 0.5, f"Section 3, facing 0 deg: heading {heading:.1f} deg, turn {turn:+.2f}")
+                return
+            self.step3 = "wall"
+            self.get_logger().info(f"Section 3: facing 0 deg ({heading:.1f}); sliding left to the wall")
+
+        if self.step3 == "wall": # slide left, still facing 0 deg, until the left side is MARGIN from the wall
+            left = np.abs(np.degrees(np.arctan2(fy, fx)) - 90) <= WINDOW # beams straight left
+            if not left.any():
+                self.move_2D(0.0, 0.0, 0.0)
+                self.log("s3", 1.0, f"Section 3: no wall seen straight left; waiting at ({bx:.2f}, {by:.2f}, {heading:.1f} deg)")
+                return
+            gap = float(np.median(fy[left])) - ROBOT_WIDTH / 2
+            if gap > MARGIN:
+                slide = min(SPEED, max(gap - MARGIN, SPEED / 4)) # slow down near the wall, but never creep
+                self.move_2D(0.0, slide - turn * BODY_X, turn)
+                self.log("s3", 0.5, f"Section 3, sliding left: {gap:.3f} m from the wall, slide {slide:.2f}, "
+                                    f"heading {heading:.1f} deg")
+                return
+            self.step3 = "wait"
+            self.move_2D(0.0, 0.0, 0.0)
+            self.get_logger().info(f"Section 3: {gap:.3f} m from the left wall at ({bx:.2f}, {by:.2f}, {heading:.1f} "
+                                   f"deg); waiting for moving obstacle {self.passed + 1}")
+            return
+
+        # The robot's path: points ahead of the front, within the body's half-width sideways (not wider, or the left
+        # wall MARGIN away would count)
+        front = (fx > ROBOT_LENGTH / 2) & (np.abs(fy) <= ROBOT_WIDTH / 2)
+        ahead = float(fx[front].min()) - ROBOT_LENGTH / 2 if front.any() else math.inf # free space in front of it
+        blocking = ahead <= OBSTACLE_GAP * ROBOT_WIDTH
+
+        if self.step3 == "wait": # stand still until an obstacle has blocked the path and gone by
+            self.move_2D(0.0, 0.0, 0.0)
+            if blocking:
+                if self.gap is None:
+                    self.get_logger().info(f"Section 3: moving obstacle {self.passed + 1} blocking, {ahead:.3f} m ahead")
+                self.gap = ahead if self.gap is None else max(self.gap, ahead)
+                self.log("s3", 0.5, f"Section 3: obstacle {self.passed + 1} blocking, {ahead:.3f} m ahead")
+            elif self.gap is not None: # it was blocking and now the path is free: go
+                distance = self.gap + ROBOT_LENGTH + MARGIN
+                self.dash, self.gap, self.step3 = (bx, by, distance), None, "dash"
+                self.get_logger().info(f"Section 3: path free ({ahead:.2f} m ahead); dashing {distance:.3f} m past "
+                                       f"obstacle {self.passed + 1} at {DASH_SPEED} m/s")
+            else:
+                self.log("s3", 1.0, f"Section 3: waiting for moving obstacle {self.passed + 1}; path free "
+                                    f"{ahead:.2f} m ahead (blocked within {OBSTACLE_GAP * ROBOT_WIDTH:.3f} m)")
+            return
+
+        # Dash: full speed, straight, holding 0 deg, until the distance is covered; then stop
+        sx, sy, distance = self.dash
+        done = math.hypot(bx - sx, by - sy)
+        if done < distance:
+            self.move_2D(DASH_SPEED, -turn * BODY_X, turn)
+            self.log("s3", 0.2, f"Section 3, dashing: {done:.2f}/{distance:.2f} m, heading {heading:.1f} deg, "
+                                f"{ahead:.2f} m free ahead")
+            return
+        self.move_2D(0.0, 0.0, 0.0)
+        self.passed += 1
+        self.get_logger().info(f"Section 3: past moving obstacle {self.passed} at ({bx:.2f}, {by:.2f}, {heading:.1f} deg)")
+        if self.passed >= MOVING_OBSTACLES:
+            self.finish(f"Section 3 done: past {self.passed} moving obstacles. End of the course")
+            return
+        self.step3 = "wait"
 
     def log(self, key, period, message):
         '''Info log, at most once every period seconds per key (key None: always)'''
@@ -616,6 +716,9 @@ class ObstacleCourseNode(Node):
             self.log("halted", 5.0, f"Holding still: {self.halted}. Ctrl+C to stop")
             return
         bx, by, heading = self.body()
+        if self.section == 3:
+            self.section_3(bx, by, heading)
+            return
         if self.path is None: # no plan yet, or no path right now: stand still and wait for the next plan
             self.move_2D(0.0, 0.0, 0.0)
             self.log("waiting", 1.0, f"No path: standing still at ({bx:.2f}, {by:.2f}, {heading:.1f} deg), replanning "
@@ -636,7 +739,7 @@ class ObstacleCourseNode(Node):
                 self.get_logger().info("Section 1 done: through the right turn, heading down the new corridor")
                 self.section = 2
         elif bx > self.end_x + ROBOT_LENGTH / 2 + MARGIN: # the whole body is past the left wall: through the door
-            self.finish(f"Section 2 done: crossed the left wall's line (x = {self.end_x:.2f}) with the whole body")
+            self.section_2_done(f"Section 2 done: crossed the left wall's line (x = {self.end_x:.2f}) with the whole body")
             return
         elif self.door is not None:
             cx, cy, nx, ny = self.door
@@ -645,7 +748,7 @@ class ObstacleCourseNode(Node):
             along = (bx - cx) * nx + (by - cy) * ny # how far past the door's line (negative: before it)
             # done once the whole body (plus MARGIN) is past the door's line
             if along > ROBOT_LENGTH / 2 + MARGIN and abs(wrap_deg(heading - through)) < HEADING_TOL:
-                self.finish("Section 2 done: through the door")
+                self.section_2_done("Section 2 done: through the door")
                 return
             if not self.door_locked and math.hypot(bx - lx, by - ly) < 2 * MARGIN: # at the line-up point
                 self.door_locked = True
