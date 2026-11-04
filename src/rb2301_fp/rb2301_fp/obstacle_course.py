@@ -80,6 +80,7 @@ STUCK_TIME, STUCK_DIST = 3.0, 0.05 # s, m: moving less than this in this long me
 INFLATE = ROBOT_WIDTH / 2 + MARGIN # m: occupied cells are grown by this; the body centre stays outside
 CLEARANCE_COST = 3.0 # a step within 2 * MARGIN beyond the inflated cells costs this many times a normal one
 PATH_LOOKAHEAD = 0.25 # m, pure pursuit along the A* path (shorter than LOOKAHEAD, so it cuts corners less)
+REPLAN_PERIOD = 0.5 # s between A* plans. Mapping still uses every scan; planning on every scan was too slow on the robot
 
 
 class Grid:
@@ -218,7 +219,9 @@ class ObstacleCourseNode(Node):
         else:
             self.max_translate_velocity = 0.3 # Please keep this in place; 0.3m/s is more than fast enough 
 
-        self.sub_scan = self.create_subscription(LaserScan, "scan", self.sub_scan_callback, 2) # Subscribe to LiDAR scan data
+        # Queue of 1: while the node is busy, only the newest scan waits. An older scan would be placed with the robot's
+        # current pose, drawn rotated by however much the robot turned since (smeared walls)
+        self.sub_scan = self.create_subscription(LaserScan, "scan", self.sub_scan_callback, 1) # Subscribe to LiDAR scan data
 
         # Subscribe to the dynamic_pose topic from Gazebo that publishes ground-truth pose data
         if self.is_simulation:
@@ -264,7 +267,8 @@ class ObstacleCourseNode(Node):
             os.makedirs(snapshots, exist_ok=True)
         self.trail = [] # body centre (x, y, heading) every tick, start frame
         self.scan_count = 0
-        self.snapshot_ticks = 0
+        self.last_snapshot = -math.inf # time.monotonic() of the last snapshot
+        self.last_plan = -math.inf # time.monotonic() of the last A* plan
         # Stopping: by default the robot stops and holds (the node keeps running, logging and mapping); with --exit
         # (the simulation tests), the node exits instead, as it used to
         self.exit_on_finish = exit_on_finish
@@ -319,7 +323,8 @@ class ObstacleCourseNode(Node):
                 if old is None or abs(self.wall_y - old) > 0.02:
                     self.log(None, 0, f"Right wall's line y = {self.wall_y:.3f} (median of {len(self.right_hits)} hits "
                                       f"straight right); end wall x = {self.end_x:.3f}")
-        if not self.calibrate: # calibration mode: map only, never plan or drive
+        if not self.calibrate and time.monotonic() - self.last_plan >= REPLAN_PERIOD: # calibration mode: map only
+            self.last_plan = time.monotonic()
             self.replan()
 
     def replan(self):
@@ -572,8 +577,8 @@ class ObstacleCourseNode(Node):
 
         if self.snapshots and self.start is not None: # map snapshots for tools/view_map.py, once a second
             self.trail.append(tuple(self.body()))
-            self.snapshot_ticks += 1
-            if self.snapshot_ticks % 20 == 0:
+            if time.monotonic() - self.last_snapshot >= 1.0: # by the clock: control ticks run late when the robot is busy
+                self.last_snapshot = time.monotonic()
                 self.save_snapshot()
 
         if self.calibrate and self.raw_pose is not None:

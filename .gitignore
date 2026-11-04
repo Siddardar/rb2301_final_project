@@ -9,3 +9,4 @@ maps/
 fp_map.npz
 test_failures/
 tests/
+/_refs

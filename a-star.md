@@ -91,6 +91,19 @@ snapshots to `maps/<session>` and shows them live.
 With `--calibrate`, the node now builds the map without planning or driving, so
 you can push the robot through the course by hand and watch the map form.
 
+## Speed on the real robot
+
+On the robot, one plan (including inflating the map) took 150–375 ms, against
+about 20 ms in the simulation. Scans and the 20 Hz control loop share one
+thread, so planning on every scan starved both. So:
+
+- **Plans every `REPLAN_PERIOD` (0.5 s).** Every scan still goes into the map,
+  and the robot follows its current path between plans.
+- **Scan queue of 1.** While the node is busy, only the newest scan waits. A
+  scan that waited longer would be placed with the robot's newer pose, rotated by
+  however much the robot had turned since, which smeared walls into arcs.
+- **Snapshots by the clock** (every 1 s), not by control ticks, which ran late.
+
 ## Test results
 
 Three random layouts. The first try had no clearance cost, used `LOOKAHEAD` for
