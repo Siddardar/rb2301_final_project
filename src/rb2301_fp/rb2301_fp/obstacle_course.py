@@ -90,7 +90,6 @@ OBSTACLE_GAP = 1.0 # robot widths: something in the robot's path this close to i
 DASH_SPEED = 0.4 # m/s past a moving obstacle (move_2D caps it at 0.3 on the real robot)
 MOVING_OBSTACLES = 2 # the course ends once the robot is past this many
 WALL_GAP = 0.10 # m between the body's left side and section 3's left wall, which the robot follows (room for drift)
-GROW_AFTER, GROW_BY = 2.0, 1.5 # s, times: nothing blocking the path for this long, reach this much further (once per wait)
 
 
 class Grid:
@@ -304,8 +303,6 @@ class ObstacleCourseNode(Node):
         # Section 3: the moving obstacles
         self.step3 = "pocket" # pocket (A* into the left pocket), face (turn to 0 deg), wait (for an obstacle), dash
         self.wall3_y = None # section 3's left wall, from the map, once a robot length of it has been seen
-        self.reach = OBSTACLE_GAP * ROBOT_WIDTH # m: something in the path this close to the front is blocking it
-        self.wait_since = None # time.monotonic() the current wait started
         self.passed = 0 # moving obstacles dashed past
         self.gap = None # closest the current obstacle came to the front while blocking the path (m); None: not seen yet
         self.dash = None # (start x, start y, distance) of the current dash
@@ -602,7 +599,7 @@ class ObstacleCourseNode(Node):
         pocket: face 0 deg; then for each obstacle, wait until it blocks the path and the path is free again (it has
         just gone by), and dash forward its distance plus the robot's length plus MARGIN. Done after MOVING_OBSTACLES.
         Waiting and dashing, the robot follows the wall: parallel to it (a slanted wall), WALL_GAP from it (cancels
-        sideways drift). If nothing blocks the path for GROW_AFTER, it looks GROW_BY times further ahead'''
+        sideways drift)'''
         if self.points is None:
             self.move_2D(0.0, 0.0, 0.0)
             return
@@ -618,7 +615,7 @@ class ObstacleCourseNode(Node):
                 self.move_2D(0.0, -turn * BODY_X, turn)
                 self.log("s3", 0.5, f"Section 3, facing 0 deg: heading {heading:.1f} deg, turn {turn:+.2f}")
                 return
-            self.step3, self.wait_since = "wait", time.monotonic()
+            self.step3 = "wait"
             self.get_logger().info(f"Section 3: facing 0 deg ({heading:.1f}) at ({bx:.2f}, {by:.2f}); waiting for "
                                    f"moving obstacle {self.passed + 1}")
 
@@ -648,7 +645,7 @@ class ObstacleCourseNode(Node):
         # The robot's path: points ahead of the front, within the body's half-width sideways
         front = (fx > ROBOT_LENGTH / 2) & (np.abs(fy) <= ROBOT_WIDTH / 2)
         ahead = float(fx[front].min()) - ROBOT_LENGTH / 2 if front.any() else math.inf # free space in front of it
-        blocking = ahead <= self.reach
+        blocking = ahead <= OBSTACLE_GAP * ROBOT_WIDTH
         wall_text = f"wall {gap:.3f} m, {angle:+.1f} deg; slide {slide:+.2f}, turn {turn:+.2f}"
 
         if self.step3 == "wait": # stay put (still following the wall) until an obstacle has blocked the path and gone by
@@ -664,12 +661,8 @@ class ObstacleCourseNode(Node):
                 self.get_logger().info(f"Section 3: path free ({ahead:.2f} m ahead); dashing {distance:.3f} m past "
                                        f"obstacle {self.passed + 1} at {DASH_SPEED} m/s")
             else:
-                if self.reach == OBSTACLE_GAP * ROBOT_WIDTH and time.monotonic() - self.wait_since > GROW_AFTER:
-                    self.reach *= GROW_BY # the obstacle may be out of reach: look further, once
-                    self.get_logger().info(f"Section 3: nothing in the path for {GROW_AFTER:.0f} s; now looking "
-                                           f"{self.reach:.3f} m ahead for moving obstacle {self.passed + 1}")
                 self.log("s3", 1.0, f"Section 3: waiting for moving obstacle {self.passed + 1}; path free "
-                                    f"{ahead:.2f} m ahead (blocked within {self.reach:.3f} m); {wall_text}")
+                                    f"{ahead:.2f} m ahead (blocked within {OBSTACLE_GAP * ROBOT_WIDTH:.3f} m); {wall_text}")
             return
 
         # Dash: full speed along the wall until the distance is covered; then stop
@@ -686,7 +679,7 @@ class ObstacleCourseNode(Node):
         if self.passed >= MOVING_OBSTACLES:
             self.finish(f"Section 3 done: past {self.passed} moving obstacles. End of the course")
             return
-        self.step3, self.wait_since, self.reach = "wait", time.monotonic(), OBSTACLE_GAP * ROBOT_WIDTH
+        self.step3 = "wait"
 
     def log(self, key, period, message):
         '''Info log, at most once every period seconds per key (key None: always)'''
