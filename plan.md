@@ -348,24 +348,21 @@ its own random angle about its centre.
 ## Part 3: section 3, the moving obstacles
 
 It starts when section 2 is done (the whole body past the left wall's line).
-Getting into position uses the map and A*; the rest is reactive, from the
-latest scan, relative to the body.
+It's reactive only: no map and no A*. Everything comes from the latest scan,
+relative to the body, plus the left wall's line from section 1.
 
-1. **Into the left pocket (map and A\*).** The pocket is just past the door,
-   against section 3's left wall: the body's back `MARGIN` past the left wall's
-   line, its left side `WALL_GAP` (0.10 m) off section 3's left wall.
-   - **Section 3's left wall** is read from the map on every plan, the same way
-     as the left wall but turned 90°. Among the rows above the robot and past
-     the left wall's line, take the one with occupied cells in the most columns
-     (with its two neighbours, for a tilted or smeared wall). The cardboard
-     sheets face the robot, so in the map they're columns and can't win.
-   - **Not seen yet** (less than a robot length of it): A* to a goal line `AHEAD`
-     forward, so the robot moves forward until it sees the wall.
-   - **Seen:** A* to the pocket, driving forward and steering as usual, with no
-     strafing. The goal moves as the wall is seen better.
-   - **Arrived** once within `2 × MARGIN` of the pocket.
-2. **Face 0°.** Turn in place, about the body centre, until the heading is
+1. **Face 0°.** Turn in place, about the body centre, until the heading is
    within `WINDOW` (5°) of the start heading.
+2. **Into the left pocket.** The left wall's line is the back limit: the
+   body's back must stay `MARGIN` past it, so the robot is clear of the door
+   frame.
+   - **Back limit:** if the body isn't past the back limit yet, drive forward,
+     holding 0°, until it is.
+   - **Slide:** then slide left until the left side is `WALL_GAP` (0.10 m) off
+     section 3's left wall. It slows near the wall, but never below half of
+     `SPEED`, because the real robot didn't strafe at a quarter. If it drifts
+     back behind the limit, it creeps forward while sliding.
+   - **Before the wall is seen** beside the body: slide at `SPEED`, holding 0°.
 3. **Follow the wall** from here on, while waiting and dashing:
    - **The wall:** every scan, take the nearest surface on the left beside the
      body, from its back to its front, and fit a line to it. That gives the
@@ -386,26 +383,28 @@ latest scan, relative to the body.
      distance plus the robot's length plus `MARGIN`. The distance is the
      furthest it was from the front while blocking. The obstacles are sheets of
      cardboard, so their depth doesn't count. Then stop.
+   - **Stop early** if something in the path is within `MARGIN`: the course's
+     end wall, or the next obstacle coming in. In run 161016 the second dash
+     needed 0.61 m, but the end wall was 0.57 m away. The robot pushed against
+     the wall, never covered the distance, and so never finished.
 5. **After the second dash,** the course is done: finish (hold still, or exit
    with `--exit`).
 
-**Why the slide went:**
+**History:**
 - Version 1 slid left to the wall. In run 142709 it stopped only 4.8 cm from
   the wall, then drifted 9 cm left over 1.1 m while holding 0° by Optitrack.
   That's why the robot now follows the wall.
 - Version 2 slid left until `WALL_GAP` from the wall. In run 145431 the slide
-  stalled at 0.13 m: at its slowest (0.05 m/s), the real robot doesn't strafe.
-  That run had also started section 3 too early, because of a wrong left wall.
+  stalled at 0.13 m, at a quarter of `SPEED`. That run had also started section
+  3 too early, because of a wrong left wall.
+- Version 3 used A* into the pocket. In run 161016 it worked in the end, but
+  spent 14 s with no path while the pocket goal sat up against the door frame.
 
 **Notes:**
 - `move_2D` caps speed at 0.3 m/s on the real robot, so the dash runs at
   0.3 m/s there.
 - With `--exit` (the simulation tests, which cover sections 1 and 2), section 2
   still finishes the run.
-- Seen from far away at a shallow angle, section 3's left wall is smeared in the
-  map. In run 142709's first section 3 map, from 0.8 m below, the longest row
-  was 12 cm short of the wall's real face. It improves as the robot gets closer,
-  and the wall following fixes what's left.
 
 ## The course map (reference only)
 
