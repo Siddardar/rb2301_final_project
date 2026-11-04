@@ -352,17 +352,33 @@ from the latest scan, relative to the body.
 
 1. **Face 0°.** Turn in place, about the body centre, until the heading is
    within `WINDOW` (5°) of the start heading.
-2. **Slide to the left wall.** Still facing 0°, slide left until the body's
-   left side is `MARGIN` from the wall. The wall is the median of the beams
-   within 5° of straight left, seen fresh, not the map's left wall line. The
-   slide slows near the wall, but never below a quarter of `SPEED`.
+2. **Slide to the left wall.** Slide left until the body's left side is
+   `WALL_GAP` (0.10 m) from the wall. The slide slows near the wall, but never
+   below a quarter of `SPEED`.
+
+   From here on, the robot **follows the wall**:
+   - **The wall:** every scan, take the nearest surface on the left beside the
+     body, from its back to its front, and fit a line to it. That gives the
+     wall's angle and distance. It's seen fresh, not taken from the map.
+   - **Heading:** turn to stay parallel to the wall, so a slanted wall works too.
+   - **Distance:** strafe gently (at most half of `SPEED`) to hold `WALL_GAP`.
+     That cancels sideways drift, which turning can't.
+   - **Why only points beside the body:** the cardboard sheets are always ahead
+     of it or behind it, so they can't throw off the fit.
+   - **No wall seen** in a scan: keep the last correction.
+
+   Real run 20261104-142709-18396 is why. The wall was straight, but the robot
+   started only 4.8 cm from it and drifted 9 cm left over 1.1 m while holding
+   0° by Optitrack. The wall then entered the path strip. One wait (13 s) was
+   for the wall, not an obstacle.
 3. **Each moving obstacle, `MOVING_OBSTACLES` (2) times:**
    - **The path:** scan points ahead of the body's front, and within the body's
-     half-width sideways. Not wider, or the left wall `MARGIN` away would count.
-   - **Wait** in place until something in the path is within `OBSTACLE_GAP` (1.0)
-     robot widths of the front. That's the obstacle blocking. Then wait until the
-     path is free again: it has just gone by.
-   - **Dash** straight at `DASH_SPEED` (0.4 m/s), holding 0°, for the obstacle's
+     half-width sideways.
+   - **Wait** in place, still following the wall, until something in the path
+     is within `OBSTACLE_GAP` (1.0) robot widths of the front. That's the
+     obstacle blocking. Then wait until the path is free again: it has just
+     gone by.
+   - **Dash** along the wall at `DASH_SPEED` (0.4 m/s) for the obstacle's
      distance plus the robot's length plus `MARGIN`. The distance is the
      furthest it was from the front while blocking. The obstacles are sheets of
      cardboard, so their depth doesn't count. Then stop.

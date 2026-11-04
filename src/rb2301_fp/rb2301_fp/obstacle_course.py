@@ -89,6 +89,7 @@ REPLAN_PERIOD = 0.5 # s between A* plans. Mapping still uses every scan; plannin
 OBSTACLE_GAP = 1.0 # robot widths: something in the robot's path this close to its front is a moving obstacle blocking it
 DASH_SPEED = 0.4 # m/s past a moving obstacle (move_2D caps it at 0.3 on the real robot)
 MOVING_OBSTACLES = 2 # the course ends once the robot is past this many
+WALL_GAP = 0.10 # m between the body's left side and section 3's left wall, which the robot follows (room for drift)
 
 
 class Grid:
@@ -279,6 +280,7 @@ class ObstacleCourseNode(Node):
         self.passed = 0 # moving obstacles dashed past
         self.gap = None # closest the current obstacle came to the front while blocking the path (m); None: not seen yet
         self.dash = None # (start x, start y, distance) of the current dash
+        self.wall_fix = None # (turn, slide, gap, angle) from the last scan that saw the left wall beside the robot
         # Map snapshots for tools/view_map.py (--snapshots DIR)
         self.snapshots = snapshots
         if snapshots:
@@ -550,9 +552,10 @@ class ObstacleCourseNode(Node):
         self.section, self.path, self.door_locked = 3, None, False
 
     def section_3(self, bx, by, heading):
-        '''The moving obstacles, reactively from the latest scan (no map): face 0 deg; slide left until the body is
-        MARGIN from the wall; then for each obstacle, wait until it blocks the path and the path is free again (it has
-        just gone by), and dash forward its distance plus the robot's length plus MARGIN. Done after MOVING_OBSTACLES'''
+        '''The moving obstacles, reactively from the latest scan (no map): face 0 deg; slide left to WALL_GAP from the
+        wall; then for each obstacle, wait until it blocks the path and the path is free again (it has just gone by),
+        and dash forward its distance plus the robot's length plus MARGIN. Done after MOVING_OBSTACLES. From the slide
+        on, the robot follows the wall: parallel to it (a slanted wall), WALL_GAP from it (cancels sideways drift)'''
         if self.points is None:
             self.move_2D(0.0, 0.0, 0.0)
             return
@@ -560,10 +563,10 @@ class ObstacleCourseNode(Node):
         h = math.radians(heading)
         dx, dy = self.points[:, 0] - bx, self.points[:, 1] - by
         fx, fy = math.cos(h) * dx + math.sin(h) * dy, -math.sin(h) * dx + math.cos(h) * dy
-        turn = 2 * SPEED * math.sin(math.radians(-heading)) / LOOKAHEAD # hold 0 deg, as pure pursuit would
 
         if self.step3 == "face": # turn in place (about the body centre) to the start heading
             if abs(heading) > WINDOW:
+                turn = 2 * SPEED * math.sin(math.radians(-heading)) / LOOKAHEAD
                 turn = math.copysign(max(abs(turn), 0.5 * SPEED / LOOKAHEAD), turn) # don't creep at the end
                 self.move_2D(0.0, -turn * BODY_X, turn)
                 self.log("s3", 0.5, f"Section 3, facing 0 deg: heading {heading:.1f} deg, turn {turn:+.2f}")
@@ -571,38 +574,54 @@ class ObstacleCourseNode(Node):
             self.step3 = "wall"
             self.get_logger().info(f"Section 3: facing 0 deg ({heading:.1f}); sliding left to the wall")
 
-        if self.step3 == "wall": # slide left, still facing 0 deg, until the left side is MARGIN from the wall
-            left = np.abs(np.degrees(np.arctan2(fy, fx)) - 90) <= WINDOW # beams straight left
-            if not left.any():
-                self.move_2D(0.0, 0.0, 0.0)
-                self.log("s3", 1.0, f"Section 3: no wall seen straight left; waiting at ({bx:.2f}, {by:.2f}, {heading:.1f} deg)")
-                return
-            gap = float(np.median(fy[left])) - ROBOT_WIDTH / 2
-            if gap > MARGIN:
-                slide = min(SPEED, max(gap - MARGIN, SPEED / 4)) # slow down near the wall, but never creep
-                self.move_2D(0.0, slide - turn * BODY_X, turn)
-                self.log("s3", 0.5, f"Section 3, sliding left: {gap:.3f} m from the wall, slide {slide:.2f}, "
-                                    f"heading {heading:.1f} deg")
+        # The left wall beside the body (from its back to its front): the nearest surface on the left, a line fitted
+        # to it. The moving obstacles are always ahead of or behind the body, never beside it
+        beside = (np.abs(fx) <= ROBOT_LENGTH / 2) & (fy > ROBOT_WIDTH / 2)
+        if beside.any():
+            beside &= fy < fy[beside].min() + 2 * MARGIN
+        if beside.sum() >= 5:
+            slope, offset = np.polyfit(fx[beside], fy[beside], 1)
+            angle = math.atan(slope) # the wall's direction, relative to the heading (positive: it bends left)
+            gap = offset * math.cos(angle) - ROBOT_WIDTH / 2 # body side to wall, perpendicular to the wall
+            turn = 2 * SPEED * math.sin(angle) / LOOKAHEAD # turn parallel to the wall, as pure pursuit would
+            if self.step3 == "wall": # slide in, slowing near the wall but never creeping
+                slide = min(SPEED, max(gap - WALL_GAP, SPEED / 4))
+            else: # hold WALL_GAP: gently, both ways
+                slide = float(np.clip(2 * (gap - WALL_GAP), -SPEED / 2, SPEED / 2))
+            self.wall_fix = (turn, slide, gap, math.degrees(angle))
+        elif self.wall_fix is None:
+            self.move_2D(0.0, 0.0, 0.0)
+            self.log("s3", 1.0, f"Section 3: no wall seen beside the robot on the left; waiting at ({bx:.2f}, "
+                                f"{by:.2f}, {heading:.1f} deg)")
+            return
+        else:
+            self.log("s3 wall", 1.0, f"Section 3: no wall seen beside the robot this scan; keeping the last correction")
+        turn, slide, gap, angle = self.wall_fix
+        lateral = slide - turn * BODY_X # plus the term that turns the robot about its body centre
+
+        if self.step3 == "wall": # slide left, parallel to the wall, until WALL_GAP from it
+            if gap > WALL_GAP:
+                self.move_2D(0.0, lateral, turn)
+                self.log("s3", 0.5, f"Section 3, sliding left: {gap:.3f} m from the wall (angle {angle:+.1f} deg), "
+                                    f"slide {slide:.2f}, turn {turn:+.2f}, heading {heading:.1f} deg")
                 return
             self.step3 = "wait"
-            self.move_2D(0.0, 0.0, 0.0)
-            self.get_logger().info(f"Section 3: {gap:.3f} m from the left wall at ({bx:.2f}, {by:.2f}, {heading:.1f} "
-                                   f"deg); waiting for moving obstacle {self.passed + 1}")
-            return
+            self.get_logger().info(f"Section 3: {gap:.3f} m from the left wall (angle {angle:+.1f} deg) at ({bx:.2f}, "
+                                   f"{by:.2f}, {heading:.1f} deg); waiting for moving obstacle {self.passed + 1}")
 
-        # The robot's path: points ahead of the front, within the body's half-width sideways (not wider, or the left
-        # wall MARGIN away would count)
+        # The robot's path: points ahead of the front, within the body's half-width sideways
         front = (fx > ROBOT_LENGTH / 2) & (np.abs(fy) <= ROBOT_WIDTH / 2)
         ahead = float(fx[front].min()) - ROBOT_LENGTH / 2 if front.any() else math.inf # free space in front of it
         blocking = ahead <= OBSTACLE_GAP * ROBOT_WIDTH
+        wall_text = f"wall {gap:.3f} m, {angle:+.1f} deg; slide {slide:+.2f}, turn {turn:+.2f}"
 
-        if self.step3 == "wait": # stand still until an obstacle has blocked the path and gone by
-            self.move_2D(0.0, 0.0, 0.0)
+        if self.step3 == "wait": # stay put (still following the wall) until an obstacle has blocked the path and gone by
+            self.move_2D(0.0, lateral, turn)
             if blocking:
                 if self.gap is None:
                     self.get_logger().info(f"Section 3: moving obstacle {self.passed + 1} blocking, {ahead:.3f} m ahead")
                 self.gap = ahead if self.gap is None else max(self.gap, ahead)
-                self.log("s3", 0.5, f"Section 3: obstacle {self.passed + 1} blocking, {ahead:.3f} m ahead")
+                self.log("s3", 0.5, f"Section 3: obstacle {self.passed + 1} blocking, {ahead:.3f} m ahead; {wall_text}")
             elif self.gap is not None: # it was blocking and now the path is free: go
                 distance = self.gap + ROBOT_LENGTH + MARGIN
                 self.dash, self.gap, self.step3 = (bx, by, distance), None, "dash"
@@ -610,16 +629,16 @@ class ObstacleCourseNode(Node):
                                        f"obstacle {self.passed + 1} at {DASH_SPEED} m/s")
             else:
                 self.log("s3", 1.0, f"Section 3: waiting for moving obstacle {self.passed + 1}; path free "
-                                    f"{ahead:.2f} m ahead (blocked within {OBSTACLE_GAP * ROBOT_WIDTH:.3f} m)")
+                                    f"{ahead:.2f} m ahead (blocked within {OBSTACLE_GAP * ROBOT_WIDTH:.3f} m); {wall_text}")
             return
 
-        # Dash: full speed, straight, holding 0 deg, until the distance is covered; then stop
+        # Dash: full speed along the wall until the distance is covered; then stop
         sx, sy, distance = self.dash
         done = math.hypot(bx - sx, by - sy)
         if done < distance:
-            self.move_2D(DASH_SPEED, -turn * BODY_X, turn)
+            self.move_2D(DASH_SPEED, lateral, turn)
             self.log("s3", 0.2, f"Section 3, dashing: {done:.2f}/{distance:.2f} m, heading {heading:.1f} deg, "
-                                f"{ahead:.2f} m free ahead")
+                                f"{ahead:.2f} m free ahead; {wall_text}")
             return
         self.move_2D(0.0, 0.0, 0.0)
         self.passed += 1
