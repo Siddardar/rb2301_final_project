@@ -73,7 +73,7 @@ MARGIN = 0.05 # m kept clear on each side of the body
 CELL = 0.025 # m, map resolution
 GROW = 1.0 # m of unknown border added on a side when the map grows
 AHEAD = 1.0 # m: before a waypoint is known, the goal is any cell this much further along the wanted direction
-WINDOW = 5.0 # deg either side of straight ahead / straight right (start frame) for the beams that measure the walls
+WINDOW = 5.0 # deg either side of straight right (start frame) for the beams that measure the right wall; heading tolerance in section 3
 OCC_WEIGHT = 4 # a cell is occupied while hits * OCC_WEIGHT > passes: a wall seen at a shallow angle (beams skimming
                # along it) stays occupied, a stray hit in open space still clears
 HEADING_TOL = 45.0 # deg: through the turn / door and this close to its direction counts as done
@@ -148,6 +148,17 @@ class Grid:
                 if math.hypot(dr, dc) * CELL <= radius:
                     out[np.clip(rows + dr, 0, out.shape[0] - 1), np.clip(cols + dc, 0, out.shape[1] - 1)] = True
         return out
+
+    def wall_x(self, beyond):
+        '''x of the longest wall across the map (running along y) beyond x = beyond: the column, past that x, with the
+        most occupied cells, counting each column with its two neighbours (a slightly tilted or smeared wall).
+        Returns (x, cells counted)'''
+        count = (self.hits * OCC_WEIGHT > self.passes).sum(axis=0)
+        count = np.convolve(count, np.ones(3), "same")
+        xs = self.x0 + (np.arange(len(count)) + 0.5) * CELL
+        count[xs <= beyond] = 0
+        k = int(np.argmax(count))
+        return float(xs[k]), int(count[k])
 
     def blocked(self, bx, by):
         '''Cells the body centre can't be in (occupied cells grown by INFLATE, except around the robot itself), and the
@@ -266,9 +277,9 @@ class ObstacleCourseNode(Node):
         self.section = 1
         # Section 1: the right turn
         self.right_hits = [] # y of every hit by a beam straight right, in section 1
-        self.ahead_max = [] # each section 1 scan's furthest hit straight ahead
-        self.end_x = -math.inf # the first corridor's end wall, which carries on as the new corridor's left wall: the
-                               # median of ahead_max (obstacles are nearer; a stray long reading can't move a median)
+        self.max_x = -math.inf # furthest x the body reached in section 1: the end wall is beyond it
+        self.end_x = -math.inf # the first corridor's end wall, which carries on as the new corridor's left wall: read
+                               # from the map at the end of section 1 (Grid.wall_x)
         self.wall_y = None # the right wall's line: the median of right_hits
         # Section 2: the door
         self.door = None # (centre x, centre y, direction through it as a unit vector x, y), start frame
@@ -337,20 +348,12 @@ class ObstacleCourseNode(Node):
             direction = np.degrees(a) % 360
             right = abs(direction - 270) <= WINDOW
             self.right_hits.extend(ey[right].tolist())
-            ahead = (direction <= WINDOW) | (direction >= 360 - WINDOW)
-            if ahead.any():
-                self.ahead_max.append(float(ex[ahead].max()))
-                old_end = self.end_x
-                self.end_x = float(np.median(self.ahead_max))
-                if abs(self.end_x - old_end) > 0.02:
-                    self.log(None, 0, f"Left wall (section 1's end wall) x = {self.end_x:.3f}: median of "
-                                      f"{len(self.ahead_max)} scans' furthest hit straight ahead")
             if self.right_hits:
                 old = self.wall_y
                 self.wall_y = float(np.median(self.right_hits))
                 if old is None or abs(self.wall_y - old) > 0.02:
                     self.log(None, 0, f"Right wall's line y = {self.wall_y:.3f} (median of {len(self.right_hits)} hits "
-                                      f"straight right); end wall x = {self.end_x:.3f}")
+                                      f"straight right)")
         if not self.calibrate and self.section < 3 and time.monotonic() - self.last_plan >= REPLAN_PERIOD: # calibration mode: map only
             self.last_plan = time.monotonic()
             self.replan()
@@ -757,8 +760,14 @@ class ObstacleCourseNode(Node):
                                    f"({bx:.2f}, {by:.2f}, {heading:.1f} deg)")
 
         if self.section == 1:
+            self.max_x = max(self.max_x, bx)
             if by < self.wall_y and abs(wrap_deg(heading + 90)) < HEADING_TOL:
-                self.get_logger().info("Section 1 done: through the right turn, heading down the new corridor")
+                # Section 1's end wall, now the left wall, from the map: everything section 1 saw, voted over every
+                # beam from every angle, so a stray or transient reading has been cleared by the beams through it
+                self.end_x, cells = self.grid.wall_x(self.max_x)
+                self.get_logger().info(f"Section 1 done: through the right turn, heading down the new corridor. Left "
+                                       f"wall x = {self.end_x:.3f} from the map ({cells} occupied cells in its 3 "
+                                       f"columns, beyond the furthest x reached, {self.max_x:.2f})")
                 self.section = 2
         elif bx > self.end_x + ROBOT_LENGTH / 2 + MARGIN: # the whole body is past the left wall: through the door
             self.section_2_done(f"Section 2 done: crossed the left wall's line (x = {self.end_x:.2f}) with the whole body")

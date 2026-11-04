@@ -57,10 +57,28 @@ Only how the robot gets to each goal changes.
 | Section 2, door locked (inside the line-up area or past it) | No A*: drive straight along the door's centre line, as before. A 0.4 m door leaves only 7.5 cm of free path once both sides are inflated, too little for a grid |
 
 **The left wall.** Section 1's end wall carries on as section 2's left wall, and
-section 1 sees it for certain: it's straight ahead the whole time. For each
-scan in section 1 (heading within 45° of 0°), take the furthest hit within 5°
-of straight ahead. `end_x` is the median of those, so a stray long reading
-can't move it the way it moved the old maximum.
+section 1 sees it for certain: it's straight ahead the whole time. At the end
+of section 1, `end_x` is read from the map (`Grid.wall_x`):
+
+- Count the occupied cells in each column, summed with its two neighbours, so a
+  slightly tilted or smeared wall still counts as one.
+- Only count columns beyond the furthest x the body reached in section 1.
+- `end_x` is the column with the most.
+
+The end wall spans the whole corridor and carries on down section 2, so it's
+the longest line across the map there. An obstacle's face is only 20–40 cm.
+The map is a vote over every beam from every angle, so a stray or transient
+reading has already been cleared by the beams that went through it.
+
+Two earlier versions read it from the beams straight ahead:
+- **The max of the hits** can take one beam through a gap or the door.
+- **The median of each scan's furthest hit** went wrong in run 145431. The
+  robot turned early, so only 10 scans counted, and half of them hit something
+  0.29 m ahead at the start. The median came out at 0.89, against 1.50 for the
+  real wall. That sent section 3 off early, in the new corridor.
+
+From the map, it's 1.50, 1.78 and 1.68 in the three real runs, matching the
+wall each time.
 
 **Door detection is off for now** (the `find_door` call is commented out in
 the scan callback): it was unreliable on the real course, while the left wall
@@ -165,10 +183,10 @@ straighten up, so it enters the door slightly off-centre.
 - **Inflation by the half-width plus half the margin only.** The robot's
   corners can still swing closer than `MARGIN` on tight turns; the clearance
   cost keeps paths away when there's room.
-- **The left wall from a median.** If an obstacle covers straight ahead for
-  more than half of section 1's scans, `end_x` lands on the obstacle. Section 2
-  would then finish too early (the robot is already past that x). The log
-  prints `Left wall ... x =` whenever it changes, and `view_map.py` draws it.
+- **The left wall from the map** is only as good as the map. A big pose jump
+  during section 1 would smear the end wall over many columns. The `Section 1
+  done` log line prints `end_x` and how many cells it was based on (about 110
+  in the real runs), and `view_map.py` draws it.
 - **Scans taken while turning** can smear walls in the map.
 - **The door posts** use the end wall's x as the left wall, with only `MARGIN`
   of slack. On a course tilted by more than a degree or two, a door far down
