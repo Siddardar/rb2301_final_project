@@ -77,8 +77,11 @@ OCC_WEIGHT = 4 # a cell is occupied while hits * OCC_WEIGHT > passes: a wall see
                # along it) stays occupied, a stray hit in open space still clears
 HEADING_TOL = 45.0 # deg: through the turn / door and this close to its direction counts as done
 STUCK_TIME, STUCK_DIST = 3.0, 0.05 # s, m: moving less than this in this long means stuck
-INFLATE = ROBOT_WIDTH / 2 + MARGIN # m: occupied cells are grown by this; the body centre stays outside
-CLEARANCE_COST = 3.0 # a step within 2 * MARGIN beyond the inflated cells costs this many times a normal one
+INFLATE = ROBOT_WIDTH / 2 + MARGIN / 2 # m: occupied cells are grown by this; the body centre stays outside. Only half
+                                       # the margin is hard, so a door barely wider than the robot stays open in the map
+CLEAR = ROBOT_WIDTH / 2 + 3 * MARGIN # m: free cells closer than this to an occupied one cost CLEARANCE_COST times more,
+CLEARANCE_COST = 3.0                 # so paths keep the full margin and more wherever there's room
+UNKNOWN_COST = 2.0 # a step into a cell never seen costs this many times more, so paths prefer space actually seen
 PATH_LOOKAHEAD = 0.25 # m, pure pursuit along the A* path (shorter than LOOKAHEAD, so it cuts corners less)
 REPLAN_PERIOD = 0.5 # s between A* plans. Mapping still uses every scan; planning on every scan was too slow on the robot
 
@@ -142,19 +145,23 @@ class Grid:
 
     def blocked(self, bx, by):
         '''Cells the body centre can't be in (occupied cells grown by INFLATE, except around the robot itself), and the
-        cells near them (within 2 * MARGIN further), which cost more to cross'''
+        cost of stepping into each cell: CLEARANCE_COST within CLEAR of an occupied cell, UNKNOWN_COST if never seen'''
         blocked = self.grown(INFLATE)
         k = int(math.ceil(INFLATE / CELL))
         r, c = self.cell(bx, by)
         blocked[max(r - k, 0):r + k + 1, max(c - k, 0):c + k + 1] = False # the robot is standing there
-        return blocked, self.grown(INFLATE + 2 * MARGIN) & ~blocked
+        cost = np.ones(blocked.shape)
+        cost[(self.hits == 0) & (self.passes == 0)] = UNKNOWN_COST
+        cost[self.grown(CLEAR) & ~blocked] *= CLEARANCE_COST
+        return blocked, cost
 
 
-def astar(blocked, near, start, goal=None, radius=0.0, direction=None, distance=0.0):
+def astar(blocked, cost_of, start, goal=None, radius=0.0, direction=None, distance=0.0):
     '''8-connected A* from start (row, col). The goal is either the cells within radius (cells) of goal (row, col), or
-    any cell at least distance (cells) further than start along direction (unit (dx, dy)). Steps into near cells cost
-    CLEARANCE_COST times more. Returns (cells or None, cells expanded, the expanded cell closest to the goal, how far
-    that cell is from the goal in cells), the last three for debugging'''
+    any cell at least distance (cells) further than start along direction (unit (dx, dy)). A step costs its length
+    times cost_of[the cell stepped into] (at least 1, so the heuristic never overestimates). Returns (cells or None,
+    cells expanded, the expanded cell closest to the goal, how far that cell is from the goal in cells), the last three
+    for debugging'''
     sr, sc = start
     if goal is not None:
         h = lambda r, c: max(0.0, math.hypot(r - goal[0], c - goal[1]) - radius)
@@ -181,7 +188,7 @@ def astar(blocked, near, start, goal=None, radius=0.0, direction=None, distance=
             for dc in (-1, 0, 1):
                 n = (r + dr, c + dc)
                 if (dr or dc) and 0 <= n[0] < rows and 0 <= n[1] < cols and not blocked[n]:
-                    ng = g + math.hypot(dr, dc) * (CLEARANCE_COST if near[n] else 1.0)
+                    ng = g + math.hypot(dr, dc) * cost_of[n]
                     if ng < cost.get(n, math.inf):
                         cost[n], parent[n] = ng, (r, c)
                         heapq.heappush(heap, (ng + h(*n), ng, n))
@@ -253,8 +260,9 @@ class ObstacleCourseNode(Node):
         self.section = 1
         # Section 1: the right turn
         self.right_hits = [] # y of every hit by a beam straight right, in section 1
-        self.end_x = -math.inf # furthest x reached straight ahead in section 1: the first corridor's end wall, which
-                               # carries on as the new corridor's left wall (obstacles are always nearer)
+        self.ahead_max = [] # each section 1 scan's furthest hit straight ahead
+        self.end_x = -math.inf # the first corridor's end wall, which carries on as the new corridor's left wall: the
+                               # median of ahead_max (obstacles are nearer; a stray long reading can't move a median)
         self.wall_y = None # the right wall's line: the median of right_hits
         # Section 2: the door
         self.door = None # (centre x, centre y, direction through it as a unit vector x, y), start frame
@@ -316,7 +324,12 @@ class ObstacleCourseNode(Node):
             self.right_hits.extend(ey[right].tolist())
             ahead = (direction <= WINDOW) | (direction >= 360 - WINDOW)
             if ahead.any():
-                self.end_x = max(self.end_x, float(ex[ahead].max()))
+                self.ahead_max.append(float(ex[ahead].max()))
+                old_end = self.end_x
+                self.end_x = float(np.median(self.ahead_max))
+                if abs(self.end_x - old_end) > 0.02:
+                    self.log(None, 0, f"Left wall (section 1's end wall) x = {self.end_x:.3f}: median of "
+                                      f"{len(self.ahead_max)} scans' furthest hit straight ahead")
             if self.right_hits:
                 old = self.wall_y
                 self.wall_y = float(np.median(self.right_hits))
@@ -336,13 +349,13 @@ class ObstacleCourseNode(Node):
         t0 = time.monotonic()
         bx, by, _ = self.body()
         start = tuple(int(v) for v in self.grid.cell(bx, by))
-        blocked, near = self.grid.blocked(bx, by)
+        blocked, cost_of = self.grid.blocked(bx, by)
         cells = None
         if self.section == 2 and self.door is not None: # near the line-up point in front of the door
             cx, cy, nx, ny = self.door
             goal = tuple(int(v) for v in self.grid.cell(cx - LOOKAHEAD * nx, cy - LOOKAHEAD * ny))
             goal_text = f"line-up point ({cx - LOOKAHEAD * nx:.2f}, {cy - LOOKAHEAD * ny:.2f}) of the door at ({cx:.2f}, {cy:.2f})"
-            cells, expanded, best, short = astar(blocked, near, start, goal=goal, radius=MARGIN / CELL)
+            cells, expanded, best, short = astar(blocked, cost_of, start, goal=goal, radius=MARGIN / CELL)
             if cells is None: # no way to this door: forget it and go back to the goal line
                 bxy = self.grid.centre(*best)
                 self.log(None, 0, f"No path to the {goal_text}: searched {expanded} cells, got to ({bxy[0]:.2f}, "
@@ -350,18 +363,23 @@ class ObstacleCourseNode(Node):
                 self.rejected.append((cx, cy))
                 self.door = None
         if cells is None:
-            # Goal line: section 1, any cell AHEAD below the right wall's line (only reachable through the right turn,
-            # which A* finds by itself); section 2, any cell AHEAD further down the corridor than the robot. The map
-            # only covers what's been seen, so grow it (as unknown space) to include the goal line first
-            distance = by - (self.wall_y - AHEAD) if self.section == 1 else AHEAD
+            # Goal line: section 1, any cell AHEAD past the right wall's line (only reachable through the right turn);
+            # section 2, any cell AHEAD past the left wall's line (only reachable through the door). A* finds the way.
+            # The map only covers what's been seen, so grow it (as unknown space) to include the goal line first
+            if self.section == 1:
+                direction, distance = (0.0, -1.0), by - (self.wall_y - AHEAD)
+                goal_text = f"goal line y <= {self.wall_y - AHEAD:.2f} (AHEAD past the right wall's line)"
+                gx, gy = bx, self.wall_y - AHEAD - CELL
+            else:
+                direction, distance = (1.0, 0.0), self.end_x + AHEAD - bx
+                goal_text = f"goal line x >= {self.end_x + AHEAD:.2f} (AHEAD past the left wall's line)"
+                gx, gy = self.end_x + AHEAD + CELL, by
             rows_before, x0, y0 = self.grid.hits.shape, self.grid.x0, self.grid.y0
-            self.grid.fit(np.array([bx]), np.array([by - distance - CELL]))
+            self.grid.fit(np.array([bx, gx]), np.array([by, gy]))
             if self.grid.hits.shape != rows_before or (self.grid.x0, self.grid.y0) != (x0, y0):
                 start = tuple(int(v) for v in self.grid.cell(bx, by))
-                blocked, near = self.grid.blocked(bx, by)
-            goal_text = f"goal line y <= {by - distance:.2f}" + (" (AHEAD below the right wall's line)" if self.section == 1
-                                                                   else " (AHEAD further down the corridor)")
-            cells, expanded, best, short = astar(blocked, near, start, direction=(0.0, -1.0), distance=distance / CELL)
+                blocked, cost_of = self.grid.blocked(bx, by)
+            cells, expanded, best, short = astar(blocked, cost_of, start, direction=direction, distance=distance / CELL)
         ms = (time.monotonic() - t0) * 1000
         if cells is None:
             occupied = self.grid.hits * OCC_WEIGHT > self.grid.passes
@@ -405,15 +423,15 @@ class ObstacleCourseNode(Node):
                 # Both posts on the same wall (the corridor's end can hide a post from upstream, and then pair with
                 # the far one), the notch deeper than both, the posts far enough apart for the robot plus margins (a
                 # gap between wall panels isn't a door), and the wall carrying on past each post (not an obstacle)
-                # ... and both posts near the new corridor's left wall (within a robot length, which allows for a
-                # course tilted a few degrees): not a gap between obstacles out in the corridor
+                # ... and both posts at or past the new corridor's left wall: a door can't be in front of the wall,
+                # so anything nearer is an obstacle or noise
                 why = None
                 if not len(inner):
                     why = "" # neighbouring groups, no notch between them: not worth logging
                 elif abs(x[post2] - x[post1]) > ROBOT_LENGTH:
                     why = "posts not on the same wall"
-                elif min(x[post1], x[post2]) < self.end_x - ROBOT_LENGTH:
-                    why = "posts not near the left wall"
+                elif min(x[post1], x[post2]) < self.end_x - MARGIN: # a door can't be in front of the left wall
+                    why = "posts in front of the left wall"
                 elif x[inner].min() <= x[post2] + ROBOT_LENGTH:
                     why = "not deep enough"
                 elif math.hypot(x[post2] - x[post1], y[post2] - y[post1]) < ROBOT_WIDTH + 2 * MARGIN:
@@ -421,8 +439,9 @@ class ObstacleCourseNode(Node):
                 elif not (self.wall_continues(x[post1], y[post1], x[post2], y[post2])
                           and self.wall_continues(x[post2], y[post2], x[post1], y[post1])):
                     why = "no wall past a post"
-                if why:
-                    rejected[why] = rejected.get(why, 0) + 1
+                if why: # log where the posts were, to see what the robot took for a door
+                    rejected.setdefault(why, []).append(((round(float(x[post1]), 2), round(float(y[post1]), 2)),
+                                                         (round(float(x[post2]), 2), round(float(y[post2]), 2))))
                 if why is None:
                     cx, cy = (x[post1] + x[post2]) / 2, (y[post1] + y[post2]) / 2
                     nx, ny = y[post2] - y[post1], -(x[post2] - x[post1]) # perpendicular to the posts' line
@@ -431,21 +450,21 @@ class ObstacleCourseNode(Node):
                     doors.append((cx, cy, nx / norm, ny / norm))
                 break
         # The door is in the left wall, so it points roughly left (0 deg); skip doors already found to have no path
-        notches = len(doors)
-        pointing = [d for d in doors if abs(math.degrees(math.atan2(d[3], d[2]))) < HEADING_TOL]
+        notches = doors
+        pointing = [d for d in notches if abs(math.degrees(math.atan2(d[3], d[2]))) < HEADING_TOL]
         doors = [d for d in pointing if all(math.hypot(d[0] - rx, d[1] - ry) > LOOKAHEAD for rx, ry in self.rejected)]
-        if notches - len(pointing):
-            rejected["not pointing left"] = notches - len(pointing)
+        if len(notches) - len(pointing):
+            rejected["not pointing left (centres)"] = [(round(d[0], 2), round(d[1], 2)) for d in notches if d not in pointing]
         if len(pointing) - len(doors):
-            rejected["near a door with no path"] = len(pointing) - len(doors)
+            rejected["near a door with no path (centres)"] = [(round(d[0], 2), round(d[1], 2)) for d in pointing if d not in doors]
         self.log("door", 1.0, f"Door search: {len(doors)} candidate(s) "
                               f"{[(round(d[0], 2), round(d[1], 2), round(math.degrees(math.atan2(d[3], d[2])))) for d in doors]}"
-                              f"; rejected {rejected or 'none'}; current door "
+                              f"; left wall x = {self.end_x:.2f}; rejected (posts) {rejected or 'none'}; current door "
                               f"{None if self.door is None else (round(self.door[0], 2), round(self.door[1], 2))}")
         if self.door is not None:
             doors.append(self.door) # keep the current one unless a door closer to the goal line turns up
         if doors:
-            best = min(doors, key=lambda d: d[1]) # closest to the goal line: furthest down the corridor
+            best = max(doors, key=lambda d: d[0]) # closest to the goal line: furthest past the left wall
             if self.door is None or math.hypot(best[0] - self.door[0], best[1] - self.door[1]) > LOOKAHEAD:
                 self.get_logger().info(f"Door at ({best[0]:.2f}, {best[1]:.2f})")
             self.door = best
@@ -496,6 +515,7 @@ class ObstacleCourseNode(Node):
                                 path=np.zeros((0, 2)) if self.path is None else self.path,
                                 target=self.path[-1] if self.path is not None else np.full(2, np.nan),
                                 wall_y=np.nan if self.wall_y is None else self.wall_y,
+                                end_x=self.end_x if np.isfinite(self.end_x) else np.nan,
                                 door=np.full(4, np.nan) if self.door is None else np.array(self.door),
                                 state=state, scan_count=self.scan_count)
         os.replace(name + ".tmp", name)
@@ -615,6 +635,9 @@ class ObstacleCourseNode(Node):
             if by < self.wall_y and abs(wrap_deg(heading + 90)) < HEADING_TOL:
                 self.get_logger().info("Section 1 done: through the right turn, heading down the new corridor")
                 self.section = 2
+        elif bx > self.end_x + ROBOT_LENGTH / 2 + MARGIN: # the whole body is past the left wall: through the door
+            self.finish(f"Section 2 done: crossed the left wall's line (x = {self.end_x:.2f}) with the whole body")
+            return
         elif self.door is not None:
             cx, cy, nx, ny = self.door
             lx, ly = cx - LOOKAHEAD * nx, cy - LOOKAHEAD * ny # line-up point

@@ -23,13 +23,17 @@ Only how the robot gets to each goal changes.
 ## Planning
 
 - **Blocked cells:** occupied cells grown by `INFLATE` = `ROBOT_WIDTH / 2 +
-  MARGIN` (0.1625 m). Cells around the robot itself are unblocked, so it can
-  plan away from something it's next to. Unknown cells are passable.
-- **Clearance cost:** a free cell within `2 × MARGIN` beyond the blocked cells
-  costs `CLEARANCE_COST` (3) times as much to cross. Paths keep to the middle
-  when there's room, but can still squeeze through narrow gaps. Without it, the
-  path hugged the blocked edge, and the robot touched obstacles in two of three
-  runs.
+  MARGIN / 2` (0.1375 m). Only half the margin is hard, so a door barely wider
+  than the robot stays open in the map. Cells around the robot itself are
+  unblocked, so it can plan away from something it's next to.
+- **Clearance cost:** a free cell closer than `CLEAR` = `ROBOT_WIDTH / 2 + 3 ×
+  MARGIN` (0.2625 m) to an occupied cell costs `CLEARANCE_COST` (3) times as
+  much to cross. Paths keep the full margin and more when there's room, but can
+  still squeeze through narrow gaps. Without it, the path hugged the blocked
+  edge, and the robot touched obstacles in two of three runs.
+- **Unknown cost:** a cell never seen (no hits, no passes) costs `UNKNOWN_COST`
+  (2) times as much, so paths prefer space the LiDAR has actually seen. It's
+  still passable: the goal lines lie in unseen space.
 - **A\*:** 8-connected, replanned after every scan. It has two kinds of goal:
   - **Goal line,** used before a waypoint is known: any cell at least `AHEAD`
     (1 m) further along a direction than the robot. This is the A* version of
@@ -38,7 +42,9 @@ Only how the robot gets to each goal changes.
   - **Goal area:** any cell within a radius of a point. Being near the point is
     good enough, so an obstacle sitting exactly on it doesn't make the goal
     unreachable.
-- **No path:** stop and exit with `No path`. That's the clean "no route" failure.
+- **No path:** stop, log the details, and keep replanning. On the real robot
+  nothing exits early. With `--exit` (simulation tests only), it exits with
+  `No path`.
 
 ## Goals
 
@@ -46,13 +52,32 @@ Only how the robot gets to each goal changes.
 |---|---|
 | Section 1, turn not found | Goal line, 0° |
 | Section 1, turn found | Goal line: any cell `AHEAD` below the right wall's line. The scan waypoint is only the handover marker, drawn in Gazebo, so A* finds its own way through the opening and round anything in its mouth |
-| Section 2, door not found | Goal line, −90° |
+| Section 2, door not found (or no path to it) | Goal line: any cell `AHEAD` past the left wall's line (`x ≥ end_x + AHEAD`). It's only reachable through the door, so A* finds the door from the map even before the door search does |
 | Section 2, door found | Area within `MARGIN` of the line-up point, `LOOKAHEAD` in front of the door's centre |
 | Section 2, door locked (inside the line-up area or past it) | No A*: drive straight along the door's centre line, as before. A 0.4 m door leaves only 7.5 cm of free path once both sides are inflated, too little for a grid |
 
-The finish conditions are unchanged. Section 1 is done when the body is past
-the right wall's line, heading within 45° of −90°. Section 2 is done when the
-whole body is past the door's line.
+**The left wall.** Section 1's end wall carries on as section 2's left wall, and
+section 1 sees it for certain: it's straight ahead the whole time. For each
+scan in section 1 (heading within 45° of 0°), take the furthest hit within 5°
+of straight ahead. `end_x` is the median of those, so a stray long reading
+can't move it the way it moved the old maximum.
+
+**Doors.** A door can't be in front of the left wall, so both posts must be at
+or past it (`x ≥ end_x − MARGIN`); anything nearer is an obstacle or noise. Of
+the doors found, the robot keeps the one closest to the goal line: furthest
+past the left wall. Rejected notches are logged with their post coordinates.
+
+**Finishing.** Section 1 is done when the body is past the right wall's line,
+heading within 45° of −90°. Section 2 is done when the whole body is past the
+door's line, or when the body centre is past the left wall's line by half the
+robot's length plus `MARGIN`, whichever comes first. The second one doesn't
+need the door to have been found.
+
+**Real run 20261104-130521-14319.** The old section 2 goal line, 1 m further
+down the corridor, ended up below the corridor's bottom wall, and the door was
+never accepted. Planned offline on that run's last map, the new goal line goes
+straight through the gap in the left wall (y −0.20 to −0.85 at x 1.88), crossing
+it at y −0.49.
 
 ## Driving
 
@@ -80,7 +105,7 @@ and once more on exit:
 
 - the map (occupied, free, unknown, using the same rule as the planner)
 - the A* path and its end
-- the right wall's line
+- the right wall's line, and the left wall's line (`end_x`)
 - the door (centre and direction)
 - the robot, its trail, and the section
 
@@ -131,10 +156,17 @@ straighten up, so it enters the door slightly off-centre.
 
 ## Known risks
 
-- **Inflation by the half-width only.** The robot's corners can still swing
-  closer than `MARGIN` on tight turns.
+- **Inflation by the half-width plus half the margin only.** The robot's
+  corners can still swing closer than `MARGIN` on tight turns; the clearance
+  cost keeps paths away when there's room.
+- **The left wall from a median.** If an obstacle covers straight ahead for
+  more than half of section 1's scans, `end_x` lands on the obstacle. Section 2
+  would then finish too early (the robot is already past that x). The log
+  prints `Left wall ... x =` whenever it changes, and `view_map.py` draws it.
 - **Scans taken while turning** can smear walls in the map.
-- **The door posts** still use the end wall's x as the left wall. The tilt fix
-  (posts must lie on a long wall in the map) comes later.
+- **The door posts** use the end wall's x as the left wall, with only `MARGIN`
+  of slack. On a course tilted by more than a degree or two, a door far down
+  the corridor can fall in front of that line and be rejected. The goal line
+  still finds it through the map.
 - **Moving obstacles** (section 3) will smear across the map. Section 3 needs its
   own approach.

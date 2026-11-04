@@ -46,6 +46,7 @@ class View:
         self.robot, = ax.plot([], [], color="tab:cyan", lw=2)
         self.heading, = ax.plot([], [], color="tab:cyan", lw=2)
         self.wall, = ax.plot([], [], color="tab:red", lw=1, ls="--")
+        self.left, = ax.plot([], [], color="tab:orange", lw=1, ls="--")
         self.door, = ax.plot([], [], color="tab:green", lw=5, solid_capstyle="butt")
         self.through, = ax.plot([], [], color="tab:green", lw=1.5)
         self.lineup, = ax.plot([], [], marker="o", ms=7, mfc="none", color="tab:green", ls="none")
@@ -53,6 +54,7 @@ class View:
         ax.set_xlabel("x (m)")
         ax.set_ylabel("y (m)")
         ax.legend(handles=[Line2D([], [], color="tab:red", lw=1, ls="--", label="right wall"),
+                           Line2D([], [], color="tab:orange", lw=1, ls="--", label="left wall"),
                            Line2D([], [], color="tab:green", lw=5, label="door"),
                            Line2D([], [], color="tab:blue", lw=2, label="A* path"),
                            Line2D([], [], marker="*", ms=12, color="tab:green", ls="none", label="path end"),
@@ -73,6 +75,8 @@ class View:
         self.trail.set_data(trail[:, 0], trail[:, 1])
         wall_y = float(snap["wall_y"])
         self.wall.set_data(*(([x0, x0 + cols * cell], [wall_y, wall_y]) if np.isfinite(wall_y) else ([], [])))
+        end_x = float(snap["end_x"]) if "end_x" in snap else np.nan # older snapshots don't have it
+        self.left.set_data(*(([end_x, end_x], [y0, y0 + rows * cell]) if np.isfinite(end_x) else ([], [])))
         door = snap["door"] if "door" in snap else np.full(4, np.nan)
         if np.all(np.isfinite(door)):
             cx, cy, nx, ny = door # centre, and the direction through it
