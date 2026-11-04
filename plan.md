@@ -353,15 +353,21 @@ relative to the body, plus the left wall's line from section 1.
 
 1. **Face 0°.** Turn in place, about the body centre, until the heading is
    within `WINDOW` (5°) of the start heading.
-2. **Into the left pocket.** The left wall's line is the back limit: the
-   body's back must stay `MARGIN` past it, so the robot is clear of the door
-   frame.
-   - **Back limit:** if the body isn't past the back limit yet, drive forward,
-     holding 0°, until it is.
+2. **Into the left pocket.** The robot's back must stay `MARGIN` clear of
+   whatever is behind it: the door frame, and the wall with the door in it,
+   which isn't necessarily straight. This is measured with the LiDAR, not the
+   left wall's line.
+   - **The strip:** points behind the back, from the body's right side up to
+     `MARGIN` short of section 3's left wall. That's where the body will sweep
+     as it slides. Section 3's own wall runs on behind the back, and would
+     otherwise always read as touching. Before that wall is seen, the strip
+     is just the body's width plus `MARGIN`, re-checked every tick.
+   - **Back:** drive forward, holding 0°, until the strip is `MARGIN` clear.
    - **Slide:** then slide left until the left side is `WALL_GAP` (0.10 m) off
-     section 3's left wall. It slows near the wall, but never below half of
-     `SPEED`, because the real robot didn't strafe at a quarter. If it drifts
-     back behind the limit, it creeps forward while sliding.
+     section 3's left wall. If the strip gets closer than `MARGIN` (a slanted
+     wall, a frame), it stops sliding and moves forward until clear. It slows
+     near the wall, but never below half of `SPEED`, because the real robot
+     didn't strafe at a quarter.
    - **Before the wall is seen** beside the body: slide at `SPEED`, holding 0°.
 3. **Follow the wall** from here on, while waiting and dashing:
    - **The wall:** every scan, take the nearest surface on the left beside the

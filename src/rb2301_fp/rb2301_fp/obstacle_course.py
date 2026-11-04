@@ -561,9 +561,10 @@ class ObstacleCourseNode(Node):
     def section_3(self, bx, by, heading):
         '''The moving obstacles, reactively from the latest scan (no map, no A*):
         1. face 0 deg
-        2. forward, if needed, until the body's back is MARGIN past the left wall's line (the back limit), so it's clear
-           of the door frame
-        3. slide left, staying past the back limit, until WALL_GAP off section 3's left wall: the left pocket
+        2. forward, if needed, until nothing is within MARGIN behind the body's back in the strip it will sweep sliding
+           left (the door frame, or a slanted wall), measured with the LiDAR
+        3. slide left, keeping that MARGIN behind (forward instead of sliding when it isn't), until WALL_GAP off
+           section 3's left wall: the left pocket
         4. for each obstacle, wait until it blocks the path and the path is free again (it has just gone by), then dash
            forward its distance plus the robot's length plus MARGIN, or until something is MARGIN ahead
         Done after MOVING_OBSTACLES. From the slide on, the robot follows the wall: parallel to it (a slanted wall), and
@@ -576,7 +577,6 @@ class ObstacleCourseNode(Node):
         dx, dy = self.points[:, 0] - bx, self.points[:, 1] - by
         fx, fy = math.cos(h) * dx + math.sin(h) * dy, -math.sin(h) * dx + math.cos(h) * dy
         hold = 2 * SPEED * math.sin(math.radians(-heading)) / LOOKAHEAD # turn rate that holds 0 deg, as pure pursuit
-        back = self.end_x + ROBOT_LENGTH / 2 + MARGIN # body centre x with the back MARGIN past the left wall's line
 
         if self.step3 == "face": # turn in place (about the body centre) to the start heading
             if abs(heading) > WINDOW:
@@ -585,18 +585,8 @@ class ObstacleCourseNode(Node):
                 self.log("s3", 0.5, f"Section 3, facing 0 deg: heading {heading:.1f} deg, turn {turn:+.2f}")
                 return
             self.step3 = "back"
-            self.get_logger().info(f"Section 3: facing 0 deg ({heading:.1f}) at ({bx:.2f}, {by:.2f}); back limit: body "
-                                   f"centre x >= {back:.2f} (left wall's line {self.end_x:.2f})")
-
-        if self.step3 == "back": # forward, holding 0 deg, until past the back limit
-            if bx < back:
-                self.move_2D(SPEED, -hold * BODY_X, hold)
-                self.log("s3", 0.5, f"Section 3, forward past the back limit: body x {bx:.2f} < {back:.2f}, heading "
-                                    f"{heading:.1f} deg")
-                return
-            self.step3 = "slide"
-            self.get_logger().info(f"Section 3: past the back limit at ({bx:.2f}, {by:.2f}, {heading:.1f} deg); "
-                                   f"sliding left into the pocket")
+            self.get_logger().info(f"Section 3: facing 0 deg ({heading:.1f}) at ({bx:.2f}, {by:.2f}); checking the "
+                                   f"space behind before sliding left")
 
         # The left wall beside the body (from its back to its front): the nearest surface on the left, a line fitted
         # to it. The moving obstacles are always ahead of or behind the body, never beside it
@@ -613,19 +603,40 @@ class ObstacleCourseNode(Node):
         elif self.wall_fix is not None:
             self.log("s3 wall", 1.0, f"Section 3: no wall seen beside the robot this scan; keeping the last correction")
 
-        if self.step3 == "slide": # left, staying past the back limit, until WALL_GAP off the wall
-            forward = SPEED / 2 if bx < back else 0.0 # drifted back toward the door frame: forward again
+        if self.step3 in ("back", "slide"):
+            # Space behind the back, in the strip the body will sweep sliding left: from its right side to MARGIN short
+            # of section 3's left wall (that wall runs on behind the back; it isn't in the way). Wall not seen yet:
+            # just the body's width plus MARGIN, re-checked every tick as it slides
+            reach = ROBOT_WIDTH / 2 + (self.wall_fix[2] - MARGIN if self.wall_fix is not None else MARGIN)
+            behind = (fx < -ROBOT_LENGTH / 2) & (fy >= -ROBOT_WIDTH / 2) & (fy <= reach)
+            clear = float(-fx[behind].max()) - ROBOT_LENGTH / 2 if behind.any() else math.inf
+        if self.step3 == "back": # forward, holding 0 deg, until MARGIN clear behind
+            if clear < MARGIN:
+                self.move_2D(SPEED, -hold * BODY_X, hold)
+                self.log("s3", 0.5, f"Section 3, forward to clear the back: {clear:.3f} m behind it (strip up to "
+                                    f"{reach:.2f} m left), body ({bx:.2f}, {by:.2f}), heading {heading:.1f} deg")
+                return
+            self.step3 = "slide"
+            self.get_logger().info(f"Section 3: {clear:.3f} m clear behind at ({bx:.2f}, {by:.2f}, {heading:.1f} deg); "
+                                   f"sliding left into the pocket")
+
+        if self.step3 == "slide": # left, keeping MARGIN behind, until WALL_GAP off the wall
+            if clear < MARGIN: # something behind (a slanted wall, the door frame): forward instead of sliding
+                self.move_2D(SPEED / 2, -hold * BODY_X, hold)
+                self.log("s3", 0.5, f"Section 3, sliding paused: only {clear:.3f} m behind the back (strip up to "
+                                    f"{reach:.2f} m left); forward, body ({bx:.2f}, {by:.2f}), heading {heading:.1f} deg")
+                return
             if self.wall_fix is None: # no wall beside yet: slide at SPEED, holding 0 deg
-                self.move_2D(forward, SPEED - hold * BODY_X, hold)
-                self.log("s3", 0.5, f"Section 3, sliding left: no wall beside yet; body ({bx:.2f}, {by:.2f}), "
-                                    f"heading {heading:.1f} deg, forward {forward:.2f}")
+                self.move_2D(0.0, SPEED - hold * BODY_X, hold)
+                self.log("s3", 0.5, f"Section 3, sliding left: no wall beside yet; {clear:.3f} m behind; body "
+                                    f"({bx:.2f}, {by:.2f}), heading {heading:.1f} deg")
                 return
             turn, _, gap, angle = self.wall_fix
             if gap > WALL_GAP:
                 slide = min(SPEED, max(gap - WALL_GAP, SPEED / 2)) # slow down near the wall, but not below SPEED / 2
-                self.move_2D(forward, slide - turn * BODY_X, turn)
+                self.move_2D(0.0, slide - turn * BODY_X, turn)
                 self.log("s3", 0.5, f"Section 3, sliding left: {gap:.3f} m from the wall (angle {angle:+.1f} deg), "
-                                    f"slide {slide:.2f}, turn {turn:+.2f}, forward {forward:.2f}, body ({bx:.2f}, "
+                                    f"{clear:.3f} m behind; slide {slide:.2f}, turn {turn:+.2f}, body ({bx:.2f}, "
                                     f"{by:.2f}), heading {heading:.1f} deg")
                 return
             self.step3 = "wait"
