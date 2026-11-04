@@ -3,6 +3,7 @@ import configparser
 import heapq
 import math
 import os
+import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -107,14 +108,16 @@ class Grid:
             self.hits = np.pad(self.hits, ((below, above), (left, right)))
             self.passes = np.pad(self.passes, ((below, above), (left, right)))
             self.x0, self.y0 = self.x0 - left * CELL, self.y0 - below * CELL
+            return True
+        return False
 
     def flat(self, x, y):
         row, col = self.cell(x, y)
         return np.unique(row * self.hits.shape[1] + col)
 
     def add_scan(self, ox, oy, ex, ey, ranges):
-        '''Beams from (ox, oy) ending at (ex, ey). Passes stop one cell short of the hit'''
-        self.fit(np.append(ex, ox), np.append(ey, oy))
+        '''Beams from (ox, oy) ending at (ex, ey). Passes stop one cell short of the hit. True if the map grew'''
+        grew = self.fit(np.append(ex, ox), np.append(ey, oy))
         c, s = (ex - ox) / ranges, (ey - oy) / ranges
         steps = np.arange(0.0, ranges.max(), CELL / 2)
         along = steps[None, :] <= (ranges - CELL)[:, None]
@@ -122,6 +125,7 @@ class Grid:
         passed = np.setdiff1d(self.flat((ox + c[:, None] * steps)[along], (oy + s[:, None] * steps)[along]), hits)
         self.passes.reshape(-1)[passed] += 1
         self.hits.reshape(-1)[hits] += 1
+        return grew
 
     def grown(self, radius):
         '''Occupied cells grown by radius (m)'''
@@ -148,7 +152,8 @@ class Grid:
 def astar(blocked, near, start, goal=None, radius=0.0, direction=None, distance=0.0):
     '''8-connected A* from start (row, col). The goal is either the cells within radius (cells) of goal (row, col), or
     any cell at least distance (cells) further than start along direction (unit (dx, dy)). Steps into near cells cost
-    CLEARANCE_COST times more. List of cells or None'''
+    CLEARANCE_COST times more. Returns (cells or None, cells expanded, the expanded cell closest to the goal, how far
+    that cell is from the goal in cells), the last three for debugging'''
     sr, sc = start
     if goal is not None:
         h = lambda r, c: max(0.0, math.hypot(r - goal[0], c - goal[1]) - radius)
@@ -158,15 +163,19 @@ def astar(blocked, near, start, goal=None, radius=0.0, direction=None, distance=
     rows, cols = blocked.shape
     cost, parent = {start: 0.0}, {}
     heap = [(h(sr, sc), 0.0, start)]
+    expanded, best, best_h = 0, start, h(sr, sc)
     while heap:
         _, g, (r, c) = heapq.heappop(heap)
         if g > cost[(r, c)]:
             continue
+        expanded += 1
+        if h(r, c) < best_h:
+            best, best_h = (r, c), h(r, c)
         if h(r, c) == 0.0:
             path = [(r, c)]
             while path[-1] in parent:
                 path.append(parent[path[-1]])
-            return path[::-1]
+            return path[::-1], expanded, best, 0.0
         for dr in (-1, 0, 1):
             for dc in (-1, 0, 1):
                 n = (r + dr, c + dc)
@@ -175,7 +184,7 @@ def astar(blocked, near, start, goal=None, radius=0.0, direction=None, distance=
                     if ng < cost.get(n, math.inf):
                         cost[n], parent[n] = ng, (r, c)
                         heapq.heappush(heap, (ng + h(*n), ng, n))
-    return None
+    return None, expanded, best, best_h
 
 
 class LidarNode(Node):
@@ -194,7 +203,7 @@ class LidarNode(Node):
 
 class ObstacleCourseNode(Node):
     '''Node to navigate obstacle course, using pose from either gazebo odometer or optitrack and lidar scan data'''
-    def __init__(self, is_simulation:bool=True, calibrate:bool=False, snapshots:str=None):
+    def __init__(self, is_simulation:bool=True, calibrate:bool=False, snapshots:str=None, exit_on_finish:bool=False):
         super().__init__('obstaclecourse')
         self.get_logger().info("Starting ObstacleCourseNode")
 
@@ -256,6 +265,11 @@ class ObstacleCourseNode(Node):
         self.trail = [] # body centre (x, y, heading) every tick, start frame
         self.scan_count = 0
         self.snapshot_ticks = 0
+        # Stopping: by default the robot stops and holds (the node keeps running, logging and mapping); with --exit
+        # (the simulation tests), the node exits instead, as it used to
+        self.exit_on_finish = exit_on_finish
+        self.halted = None # reason the robot is holding still for good (e.g. section 2 done)
+        self.log_times = {} # key -> last time a rate-limited log line was printed
 
     def sub_scan_callback(self, msg):
         """Scan subscriber"""
@@ -278,7 +292,14 @@ class ObstacleCourseNode(Node):
         self.points = np.stack((ex, ey), axis=1)
         if self.grid is None:
             self.grid = Grid(lx, ly)
-        self.grid.add_scan(lx, ly, ex, ey, ranges[valid])
+            self.log(None, 0, f"Start pose {np.round(self.start, 3).tolist()} (pose frame); map made at the LiDAR ({lx:.2f}, {ly:.2f})")
+        if self.grid.add_scan(lx, ly, ex, ey, ranges[valid]):
+            rows, cols = self.grid.hits.shape
+            self.log(None, 0, f"Map grew to {rows} x {cols} cells, x {self.grid.x0:.2f}..{self.grid.x0 + cols * CELL:.2f}, "
+                              f"y {self.grid.y0:.2f}..{self.grid.y0 + rows * CELL:.2f}")
+        self.log("scan", 1.0, f"Scan {self.scan_count}: {int(valid.sum())}/{len(ranges)} valid beams, range_min "
+                              f"{msg.range_min:.2f}; robot (start frame) ({x:.3f}, {y:.3f}, {heading:.1f} deg); "
+                              f"section {self.section}")
 
         if self.section == 2:
             self.find_door(ex, ey, a)
@@ -293,7 +314,11 @@ class ObstacleCourseNode(Node):
             if ahead.any():
                 self.end_x = max(self.end_x, float(ex[ahead].max()))
             if self.right_hits:
+                old = self.wall_y
                 self.wall_y = float(np.median(self.right_hits))
+                if old is None or abs(self.wall_y - old) > 0.02:
+                    self.log(None, 0, f"Right wall's line y = {self.wall_y:.3f} (median of {len(self.right_hits)} hits "
+                                      f"straight right); end wall x = {self.end_x:.3f}")
         if not self.calibrate: # calibration mode: map only, never plan or drive
             self.replan()
 
@@ -303,6 +328,7 @@ class ObstacleCourseNode(Node):
             return # straight through the door along its centre line, no A*
         if self.wall_y is None:
             return
+        t0 = time.monotonic()
         bx, by, _ = self.body()
         start = tuple(int(v) for v in self.grid.cell(bx, by))
         blocked, near = self.grid.blocked(bx, by)
@@ -310,9 +336,12 @@ class ObstacleCourseNode(Node):
         if self.section == 2 and self.door is not None: # near the line-up point in front of the door
             cx, cy, nx, ny = self.door
             goal = tuple(int(v) for v in self.grid.cell(cx - LOOKAHEAD * nx, cy - LOOKAHEAD * ny))
-            cells = astar(blocked, near, start, goal=goal, radius=MARGIN / CELL)
+            goal_text = f"line-up point ({cx - LOOKAHEAD * nx:.2f}, {cy - LOOKAHEAD * ny:.2f}) of the door at ({cx:.2f}, {cy:.2f})"
+            cells, expanded, best, short = astar(blocked, near, start, goal=goal, radius=MARGIN / CELL)
             if cells is None: # no way to this door: forget it and go back to the goal line
-                self.get_logger().info(f"No path to the door at ({cx:.2f}, {cy:.2f}): ignoring it")
+                bxy = self.grid.centre(*best)
+                self.log(None, 0, f"No path to the {goal_text}: searched {expanded} cells, got to ({bxy[0]:.2f}, "
+                                  f"{bxy[1]:.2f}), {short * CELL:.2f} m short. Ignoring this door")
                 self.rejected.append((cx, cy))
                 self.door = None
         if cells is None:
@@ -325,10 +354,26 @@ class ObstacleCourseNode(Node):
             if self.grid.hits.shape != rows_before or (self.grid.x0, self.grid.y0) != (x0, y0):
                 start = tuple(int(v) for v in self.grid.cell(bx, by))
                 blocked, near = self.grid.blocked(bx, by)
-            cells = astar(blocked, near, start, direction=(0.0, -1.0), distance=distance / CELL)
+            goal_text = f"goal line y <= {by - distance:.2f}" + (" (AHEAD below the right wall's line)" if self.section == 1
+                                                                   else " (AHEAD further down the corridor)")
+            cells, expanded, best, short = astar(blocked, near, start, direction=(0.0, -1.0), distance=distance / CELL)
+        ms = (time.monotonic() - t0) * 1000
         if cells is None:
-            self.finish("No path")
+            occupied = self.grid.hits * OCC_WEIGHT > self.grid.passes
+            bxy = self.grid.centre(*best)
+            r, c = start
+            self.log("nopath", 0.5, f"NO PATH to the {goal_text}. Searched {expanded} cells in {ms:.0f} ms; closest it "
+                     f"got: ({bxy[0]:.2f}, {bxy[1]:.2f}), {short * CELL:.2f} m short. Robot ({bx:.2f}, {by:.2f}) cell "
+                     f"{start}: hits {self.grid.hits[r, c]}, passes {self.grid.passes[r, c]}. Map {occupied.shape[0]} x "
+                     f"{occupied.shape[1]}: {int(occupied.sum())} occupied, {int(blocked.sum())} blocked cells")
+            if self.exit_on_finish:
+                self.finish("No path")
+            self.path = None # stop and keep replanning on every scan
+            return
         self.path = np.array([self.grid.centre(r, c) for r, c in cells])
+        length = float(np.hypot(*np.diff(self.path, axis=0).T).sum()) if len(self.path) > 1 else 0.0
+        self.log("plan", 1.0, f"Plan to the {goal_text}: {len(cells)} cells, {length:.2f} m, ends ({self.path[-1][0]:.2f}, "
+                              f"{self.path[-1][1]:.2f}); searched {expanded} cells; {ms:.0f} ms including the map")
 
     def find_door(self, ex, ey, a):
         '''Section 2: the door is a notch in the left wall, a run of beams reaching more than ROBOT_LENGTH further left
@@ -344,7 +389,7 @@ class ObstacleCourseNode(Node):
         x, y = ex[side], ey[side]
         groups = np.split(np.arange(len(x)), np.flatnonzero(abs(np.diff(x)) > ROBOT_LENGTH) + 1)
         bx, by, _ = self.body()
-        doors = []
+        doors, rejected = [], {} # rejected: reason -> count, for the log
         for p in range(len(groups) - 2):
             post1 = groups[p][-1]
             for q in range(p + 1, len(groups)):
@@ -357,12 +402,23 @@ class ObstacleCourseNode(Node):
                 # gap between wall panels isn't a door), and the wall carrying on past each post (not an obstacle)
                 # ... and both posts near the new corridor's left wall (within a robot length, which allows for a
                 # course tilted a few degrees): not a gap between obstacles out in the corridor
-                if (len(inner) and abs(x[post2] - x[post1]) <= ROBOT_LENGTH
-                        and min(x[post1], x[post2]) >= self.end_x - ROBOT_LENGTH
-                        and x[inner].min() > x[post2] + ROBOT_LENGTH
-                        and math.hypot(x[post2] - x[post1], y[post2] - y[post1]) >= ROBOT_WIDTH + 2 * MARGIN
-                        and self.wall_continues(x[post1], y[post1], x[post2], y[post2])
-                        and self.wall_continues(x[post2], y[post2], x[post1], y[post1])):
+                why = None
+                if not len(inner):
+                    why = "" # neighbouring groups, no notch between them: not worth logging
+                elif abs(x[post2] - x[post1]) > ROBOT_LENGTH:
+                    why = "posts not on the same wall"
+                elif min(x[post1], x[post2]) < self.end_x - ROBOT_LENGTH:
+                    why = "posts not near the left wall"
+                elif x[inner].min() <= x[post2] + ROBOT_LENGTH:
+                    why = "not deep enough"
+                elif math.hypot(x[post2] - x[post1], y[post2] - y[post1]) < ROBOT_WIDTH + 2 * MARGIN:
+                    why = "too narrow"
+                elif not (self.wall_continues(x[post1], y[post1], x[post2], y[post2])
+                          and self.wall_continues(x[post2], y[post2], x[post1], y[post1])):
+                    why = "no wall past a post"
+                if why:
+                    rejected[why] = rejected.get(why, 0) + 1
+                if why is None:
                     cx, cy = (x[post1] + x[post2]) / 2, (y[post1] + y[post2]) / 2
                     nx, ny = y[post2] - y[post1], -(x[post2] - x[post1]) # perpendicular to the posts' line
                     norm = math.hypot(nx, ny)
@@ -370,8 +426,17 @@ class ObstacleCourseNode(Node):
                     doors.append((cx, cy, nx / norm, ny / norm))
                 break
         # The door is in the left wall, so it points roughly left (0 deg); skip doors already found to have no path
-        doors = [d for d in doors if abs(math.degrees(math.atan2(d[3], d[2]))) < HEADING_TOL
-                 and all(math.hypot(d[0] - rx, d[1] - ry) > LOOKAHEAD for rx, ry in self.rejected)]
+        notches = len(doors)
+        pointing = [d for d in doors if abs(math.degrees(math.atan2(d[3], d[2]))) < HEADING_TOL]
+        doors = [d for d in pointing if all(math.hypot(d[0] - rx, d[1] - ry) > LOOKAHEAD for rx, ry in self.rejected)]
+        if notches - len(pointing):
+            rejected["not pointing left"] = notches - len(pointing)
+        if len(pointing) - len(doors):
+            rejected["near a door with no path"] = len(pointing) - len(doors)
+        self.log("door", 1.0, f"Door search: {len(doors)} candidate(s) "
+                              f"{[(round(d[0], 2), round(d[1], 2), round(math.degrees(math.atan2(d[3], d[2])))) for d in doors]}"
+                              f"; rejected {rejected or 'none'}; current door "
+                              f"{None if self.door is None else (round(self.door[0], 2), round(self.door[1], 2))}")
         if self.door is not None:
             doors.append(self.door) # keep the current one unless a door closer to the goal line turns up
         if doors:
@@ -431,9 +496,22 @@ class ObstacleCourseNode(Node):
         os.replace(name + ".tmp", name)
 
     def finish(self, reason):
+        '''Stop. With --exit, also exit the node (the simulation tests); otherwise hold still for good, still mapping
+        and logging, until Ctrl+C'''
         self.move_2D(0.0, 0.0, 0.0)
         self.get_logger().info(f"Finished: {reason}")
-        raise SystemExit
+        if self.exit_on_finish:
+            raise SystemExit
+        self.halted = reason
+
+    def log(self, key, period, message):
+        '''Info log, at most once every period seconds per key (key None: always)'''
+        now = time.monotonic()
+        if key is not None:
+            if now - self.log_times.get(key, -math.inf) < period:
+                return
+            self.log_times[key] = now
+        self.get_logger().info(message)
 
     def steer(self, cx, cy, lookahead):
         '''Pure pursuit toward (cx, cy), about lookahead away: turn on the arc through it, slower the further off it
@@ -443,7 +521,9 @@ class ObstacleCourseNode(Node):
         bx, by, heading = self.body()
         alpha = math.radians(wrap_deg(math.degrees(math.atan2(cy - by, cx - bx)) - heading))
         turn = 2 * SPEED * (math.sin(alpha) if abs(alpha) <= math.pi / 2 else math.copysign(1.0, alpha)) / lookahead
-        self.move_2D(SPEED * max(math.cos(alpha), 0.0), -turn * BODY_X, turn)
+        speed = SPEED * max(math.cos(alpha), 0.0)
+        self.move_2D(speed, -turn * BODY_X, turn)
+        return speed, turn, math.degrees(alpha)
 
     def yaw_from_quaternion(self, q):
         '''Returns yaw angle (in rad) for orientation based on given quaternion input q'''
@@ -506,14 +586,25 @@ class ObstacleCourseNode(Node):
         ###### INSERT CODE HERE ######
         if self.start is None:
             self.start = np.array(self.pose, dtype=float)
-        if self.path is None:
-            return # waiting for the first plan
+        if self.halted is not None:
+            self.move_2D(0.0, 0.0, 0.0)
+            self.log("halted", 5.0, f"Holding still: {self.halted}. Ctrl+C to stop")
+            return
         bx, by, heading = self.body()
+        if self.path is None: # no plan yet, or no path right now: stand still and wait for the next plan
+            self.move_2D(0.0, 0.0, 0.0)
+            self.log("waiting", 1.0, f"No path: standing still at ({bx:.2f}, {by:.2f}, {heading:.1f} deg), replanning "
+                                     f"on every scan")
+            self.last_move = None
+            return
         now = self.get_clock().now().nanoseconds * 1e-9
         if self.last_move is None or math.hypot(bx - self.last_move[1], by - self.last_move[2]) >= STUCK_DIST:
             self.last_move = (now, bx, by)
         elif now - self.last_move[0] > STUCK_TIME:
-            self.finish("Stuck")
+            if self.exit_on_finish:
+                self.finish("Stuck")
+            self.log("stuck", 2.0, f"WARNING: moved less than {STUCK_DIST} m in {now - self.last_move[0]:.1f} s, at "
+                                   f"({bx:.2f}, {by:.2f}, {heading:.1f} deg)")
 
         if self.section == 1:
             if by < self.wall_y and abs(wrap_deg(heading + 90)) < HEADING_TOL:
@@ -527,18 +618,26 @@ class ObstacleCourseNode(Node):
             # done once the whole body (plus MARGIN) is past the door's line
             if along > ROBOT_LENGTH / 2 + MARGIN and abs(wrap_deg(heading - through)) < HEADING_TOL:
                 self.finish("Section 2 done: through the door")
+                return
             if not self.door_locked and math.hypot(bx - lx, by - ly) < 2 * MARGIN: # at the line-up point
                 self.door_locked = True
                 self.get_logger().info(f"Door locked at ({cx:.2f}, {cy:.2f}), heading through it {through:.0f} deg")
             if self.door_locked: # pure pursuit along the door's centre line, LOOKAHEAD past the robot's projection
                 px, py = cx + (along + LOOKAHEAD) * nx, cy + (along + LOOKAHEAD) * ny
-                self.steer(px, py, LOOKAHEAD)
+                speed, turn, alpha = self.steer(px, py, LOOKAHEAD)
+                self.log("drive", 0.5, f"Through the door: robot ({bx:.2f}, {by:.2f}, {heading:.1f} deg), {along:+.2f} m "
+                                       f"past its line; aim ({px:.2f}, {py:.2f}), {alpha:+.0f} deg off; speed "
+                                       f"{speed:.2f}, turn {turn:+.2f}")
                 return
 
         # Pure pursuit along the planned path: the carrot is the first point PATH_LOOKAHEAD past the closest one
         d = np.hypot(self.path[:, 0] - bx, self.path[:, 1] - by)
         ahead = np.flatnonzero((np.arange(len(d)) > np.argmin(d)) & (d >= PATH_LOOKAHEAD))
-        self.steer(*self.path[ahead[0] if len(ahead) else -1], PATH_LOOKAHEAD)
+        carrot = self.path[ahead[0] if len(ahead) else -1]
+        speed, turn, alpha = self.steer(carrot[0], carrot[1], PATH_LOOKAHEAD)
+        self.log("drive", 0.5, f"Drive (section {self.section}): robot ({bx:.2f}, {by:.2f}, {heading:.1f} deg); carrot "
+                               f"({carrot[0]:.2f}, {carrot[1]:.2f}), {alpha:+.0f} deg off; speed {speed:.2f}, turn "
+                               f"{turn:+.2f}; {len(self.path)} path points left of the plan")
         ###### INSERT CODE HERE ######
                 
 
@@ -546,6 +645,7 @@ def main(args=None):
     arg_parser = argparse.ArgumentParser(description="RB2301 final project")
     arg_parser.add_argument('--calibrate', action='store_true', help="Real robot: only print the Optitrack pose and the maze-frame pose twice a second, never drive")
     arg_parser.add_argument('--snapshots', metavar='DIR', help="Save a map snapshot to DIR once a second, for tools/view_map.py")
+    arg_parser.add_argument('--exit', action='store_true', help="Exit when finished, stuck or with no path (the simulation tests). By default the robot stops and holds, and the node keeps running")
     cli_args, ros_args = arg_parser.parse_known_args(args=args)
     print("Starting obstacle course")
     rclpy.init(args=ros_args)
@@ -558,7 +658,7 @@ def main(args=None):
     lidar.destroy_node()
 
     # Start spinning the obstacle node and only stop once SystemExit error is raised within the node callback
-    obstacle = ObstacleCourseNode(is_simulation, cli_args.calibrate, cli_args.snapshots)
+    obstacle = ObstacleCourseNode(is_simulation, cli_args.calibrate, cli_args.snapshots, cli_args.exit)
     try:
         rclpy.spin(obstacle)
     except (SystemExit, KeyboardInterrupt):

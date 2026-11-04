@@ -32,6 +32,9 @@ Controls: ENTER = start, s = pause, r = resume, q / Ctrl+C = stop everything.
 The node saves a map snapshot once a second on the robot, in the session's log
 directory. With --map, they're also copied to maps/<session> here. The viewer
 stays open after the session ends, so you can step back through the run.
+
+When the session ends, the robot's logs (planner.log with the node's output,
+base.log, lidar.log, pose.log) are copied once to maps/<session>/logs here.
 HELP
 }
 
@@ -127,7 +130,18 @@ tmux_session="fp-${robot_num}-${session}"
 cleanup() {
     local result=$?
     trap - EXIT INT TERM
-    if (( prepared )); then remote_runner stop || true; fi
+    if (( prepared )); then
+        remote_runner stop || true
+        # Copy the session's logs here once, now that everything on the robot has stopped
+        local local_logs="$script_dir/maps/$session/logs"
+        mkdir -p "$local_logs"
+        if rsync -az -e "$(quote_command ssh "${ssh_options[@]}" -o BatchMode=yes)" \
+                --include '*.log' --include 'failed' --exclude '*' "$target:$state/" "$local_logs/" 2>/dev/null; then
+            echo "Robot logs copied to $local_logs"
+        else
+            echo "Couldn't copy the robot logs. They're on the robot in $state" >&2
+        fi
+    fi
     if [[ $terminal == tmux ]] && (( ! setup_only )); then
         tmux kill-session -t "$tmux_session" 2>/dev/null || true
     fi
