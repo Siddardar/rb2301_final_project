@@ -62,6 +62,12 @@ scan in section 1 (heading within 45° of 0°), take the furthest hit within 5°
 of straight ahead. `end_x` is the median of those, so a stray long reading
 can't move it the way it moved the old maximum.
 
+**Door detection is off for now** (the `find_door` call is commented out in
+the scan callback): it was unreliable on the real course, while the left wall
+goal line found the door by itself. Section 2 follows the goal line, and hands
+over to section 3 once the whole body is past the left wall's line. The rest
+of this paragraph describes it for when it's back on.
+
 **Doors.** A door can't be in front of the left wall, so both posts must be at
 or past it (`x ≥ end_x − MARGIN`); anything nearer is an obstacle or noise. Of
 the doors found, the robot keeps the one closest to the goal line: furthest

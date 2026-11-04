@@ -325,9 +325,12 @@ class ObstacleCourseNode(Node):
                               f"{msg.range_min:.2f}; robot (start frame) ({x:.3f}, {y:.3f}, {heading:.1f} deg); "
                               f"section {self.section}")
 
-        if self.section == 2:
-            self.find_door(ex, ey, a)
-        elif self.section == 1 and abs(heading) < HEADING_TOL: # section 1, still driving along the first corridor: the right wall's line,
+        # Door detection is off for now (unreliable on the real course): section 2 just follows the goal line past the
+        # left wall, and hands over to section 3 once the whole body is past it. With no door found, self.door stays
+        # None, so the door goal in replan() and the door drive in timer_callback() never run. To turn it back on:
+        # if self.section == 2:
+        #     self.find_door(ex, ey, a)
+        if self.section == 1 and abs(heading) < HEADING_TOL: # section 1, still driving along the first corridor: the right wall's line,
             # from the beams straight right. Most of them hit the wall; hits on obstacles beside the robot, or on things
             # seen through the opening, are too few to move the median. Not once turning into the opening: then
             # "straight right" points down the new corridor
