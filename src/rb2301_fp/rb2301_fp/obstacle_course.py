@@ -668,7 +668,7 @@ class ObstacleCourseNode(Node):
         # end wall, or the next obstacle coming into the path); then stop
         sx, sy, distance = self.dash
         done = math.hypot(bx - sx, by - sy)
-        if done < distance and ahead > MARGIN:
+        if done < distance and ahead > MARGIN / 2:
             self.move_2D(DASH_SPEED, lateral, turn)
             self.log("s3", 0.2, f"Section 3, dashing: {done:.2f}/{distance:.2f} m, heading {heading:.1f} deg, "
                                 f"{ahead:.2f} m free ahead; {wall_text}")
