@@ -347,51 +347,68 @@ its own random angle about its centre.
 
 ## Part 3: section 3, the moving obstacles
 
-Reactive only: no map and no A*. It starts when section 2 is done, and works
-from the latest scan, relative to the body.
+It starts when section 2 is done (the whole body past the left wall's line).
+Getting into position uses the map and A*; the rest is reactive, from the
+latest scan, relative to the body.
 
-1. **Face 0°.** Turn in place, about the body centre, until the heading is
+1. **Into the left pocket (map and A\*).** The pocket is just past the door,
+   against section 3's left wall: the body's back `MARGIN` past the left wall's
+   line, its left side `WALL_GAP` (0.10 m) off section 3's left wall.
+   - **Section 3's left wall** is read from the map on every plan, the same way
+     as the left wall but turned 90°. Among the rows above the robot and past
+     the left wall's line, take the one with occupied cells in the most columns
+     (with its two neighbours, for a tilted or smeared wall). The cardboard
+     sheets face the robot, so in the map they're columns and can't win.
+   - **Not seen yet** (less than a robot length of it): A* to a goal line `AHEAD`
+     forward, so the robot moves forward until it sees the wall.
+   - **Seen:** A* to the pocket, driving forward and steering as usual, with no
+     strafing. The goal moves as the wall is seen better.
+   - **Arrived** once within `2 × MARGIN` of the pocket.
+2. **Face 0°.** Turn in place, about the body centre, until the heading is
    within `WINDOW` (5°) of the start heading.
-2. **Slide to the left wall.** Slide left until the body's left side is
-   `WALL_GAP` (0.10 m) from the wall. The slide slows near the wall, but never
-   below a quarter of `SPEED`.
-
-   From here on, the robot **follows the wall**:
+3. **Follow the wall** from here on, while waiting and dashing:
    - **The wall:** every scan, take the nearest surface on the left beside the
      body, from its back to its front, and fit a line to it. That gives the
-     wall's angle and distance. It's seen fresh, not taken from the map.
+     wall's angle and distance.
    - **Heading:** turn to stay parallel to the wall, so a slanted wall works too.
    - **Distance:** strafe gently (at most half of `SPEED`) to hold `WALL_GAP`.
      That cancels sideways drift, which turning can't.
    - **Why only points beside the body:** the cardboard sheets are always ahead
      of it or behind it, so they can't throw off the fit.
    - **No wall seen** in a scan: keep the last correction.
-
-   Real run 20261104-142709-18396 is why. The wall was straight, but the robot
-   started only 4.8 cm from it and drifted 9 cm left over 1.1 m while holding
-   0° by Optitrack. The wall then entered the path strip. One wait (13 s) was
-   for the wall, not an obstacle.
-3. **Each moving obstacle, `MOVING_OBSTACLES` (2) times:**
+4. **Each moving obstacle, `MOVING_OBSTACLES` (2) times:**
    - **The path:** scan points ahead of the body's front, and within the body's
      half-width sideways.
-   - **Wait** in place, still following the wall, until something in the path
-     is within `OBSTACLE_GAP` (1.0) robot widths of the front. That's the
-     obstacle blocking. Then wait until the path is free again: it has just
-     gone by.
+   - **Wait** in place until something in the path is within the reach of the
+     front: `OBSTACLE_GAP` (1.0) robot widths. That's the obstacle blocking. Then
+     wait until the path is free again: it has just gone by.
+   - **Reach:** if nothing blocks the path for `GROW_AFTER` (2 s), the reach
+     grows by `GROW_BY` (1.5), once per wait. That's for an obstacle whose lane
+     is too far ahead to count. It goes back to one robot width after each dash.
    - **Dash** along the wall at `DASH_SPEED` (0.4 m/s) for the obstacle's
      distance plus the robot's length plus `MARGIN`. The distance is the
      furthest it was from the front while blocking. The obstacles are sheets of
      cardboard, so their depth doesn't count. Then stop.
-4. **After the second dash,** the course is done: finish (hold still, or exit
+5. **After the second dash,** the course is done: finish (hold still, or exit
    with `--exit`).
+
+**Why the slide went:**
+- Version 1 slid left to the wall. In run 142709 it stopped only 4.8 cm from
+  the wall, then drifted 9 cm left over 1.1 m while holding 0° by Optitrack.
+  That's why the robot now follows the wall.
+- Version 2 slid left until `WALL_GAP` from the wall. In run 145431 the slide
+  stalled at 0.13 m: at its slowest (0.05 m/s), the real robot doesn't strafe.
+  That run had also started section 3 too early, because of a wrong left wall.
 
 **Notes:**
 - `move_2D` caps speed at 0.3 m/s on the real robot, so the dash runs at
   0.3 m/s there.
 - With `--exit` (the simulation tests, which cover sections 1 and 2), section 2
   still finishes the run.
-- If the second obstacle's lane is more than one robot width ahead after the
-  first dash, it never counts as blocking, and the robot waits for good.
+- Seen from far away at a shallow angle, section 3's left wall is smeared in the
+  map. In run 142709's first section 3 map, from 0.8 m below, the longest row
+  was 12 cm short of the wall's real face. It improves as the robot gets closer,
+  and the wall following fixes what's left.
 
 ## The course map (reference only)
 

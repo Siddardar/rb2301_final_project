@@ -90,6 +90,7 @@ OBSTACLE_GAP = 1.0 # robot widths: something in the robot's path this close to i
 DASH_SPEED = 0.4 # m/s past a moving obstacle (move_2D caps it at 0.3 on the real robot)
 MOVING_OBSTACLES = 2 # the course ends once the robot is past this many
 WALL_GAP = 0.10 # m between the body's left side and section 3's left wall, which the robot follows (room for drift)
+GROW_AFTER, GROW_BY = 2.0, 1.5 # s, times: nothing blocking the path for this long, reach this much further (once per wait)
 
 
 class Grid:
@@ -159,6 +160,20 @@ class Grid:
         count[xs <= beyond] = 0
         k = int(np.argmax(count))
         return float(xs[k]), int(count[k])
+
+    def wall_y(self, above, beyond):
+        '''y of the longest wall along x in the map above y = above and past x = beyond: the row whose band (it and its
+        two neighbours, for a slightly tilted or smeared wall) has occupied cells in the most columns. Returns (y, how
+        long that is in m)'''
+        occupied = self.hits * OCC_WEIGHT > self.passes
+        xs = self.x0 + (np.arange(occupied.shape[1]) + 0.5) * CELL
+        ys = self.y0 + (np.arange(occupied.shape[0]) + 0.5) * CELL
+        occupied = occupied[:, xs > beyond]
+        occupied[ys <= above] = False
+        padded = np.pad(occupied, ((1, 1), (0, 0)))
+        length = (padded[:-2] | padded[1:-1] | padded[2:]).sum(axis=1) * CELL
+        k = int(np.argmax(length))
+        return float(ys[k]), float(length[k])
 
     def blocked(self, bx, by):
         '''Cells the body centre can't be in (occupied cells grown by INFLATE, except around the robot itself), and the
@@ -287,7 +302,10 @@ class ObstacleCourseNode(Node):
         self.rejected = [] # centres of doors with no path to them: ignore notches near these
         self.last_move = None # (time, x, y) when the robot last moved STUCK_DIST
         # Section 3: the moving obstacles
-        self.step3 = "face" # face (turn to 0 deg), wall (slide left to the wall), wait (for an obstacle), dash (past it)
+        self.step3 = "pocket" # pocket (A* into the left pocket), face (turn to 0 deg), wait (for an obstacle), dash
+        self.wall3_y = None # section 3's left wall, from the map, once a robot length of it has been seen
+        self.reach = OBSTACLE_GAP * ROBOT_WIDTH # m: something in the path this close to the front is blocking it
+        self.wait_since = None # time.monotonic() the current wait started
         self.passed = 0 # moving obstacles dashed past
         self.gap = None # closest the current obstacle came to the front while blocking the path (m); None: not seen yet
         self.dash = None # (start x, start y, distance) of the current dash
@@ -354,7 +372,8 @@ class ObstacleCourseNode(Node):
                 if old is None or abs(self.wall_y - old) > 0.02:
                     self.log(None, 0, f"Right wall's line y = {self.wall_y:.3f} (median of {len(self.right_hits)} hits "
                                       f"straight right)")
-        if not self.calibrate and self.section < 3 and time.monotonic() - self.last_plan >= REPLAN_PERIOD: # calibration mode: map only
+        planning = self.section < 3 or self.step3 == "pocket" # section 3 only plans into the left pocket
+        if not self.calibrate and planning and time.monotonic() - self.last_plan >= REPLAN_PERIOD: # calibration: map only
             self.last_plan = time.monotonic()
             self.replan()
 
@@ -380,18 +399,33 @@ class ObstacleCourseNode(Node):
                                   f"{bxy[1]:.2f}), {short * CELL:.2f} m short. Ignoring this door")
                 self.rejected.append((cx, cy))
                 self.door = None
-        if cells is None:
+        if self.section == 3: # section 3: the left pocket, just past the door, WALL_GAP off section 3's left wall
+            wy, length = self.grid.wall_y(by, self.end_x + MARGIN) # the longest wall above the robot past the left wall
+            self.wall3_y = wy if length >= ROBOT_LENGTH else None # seen once a robot length of it is in the map
+        if self.section == 3 and self.wall3_y is not None:
+            px, py = self.pocket()
+            goal = tuple(int(v) for v in self.grid.cell(px, py))
+            goal_text = (f"left pocket ({px:.2f}, {py:.2f}), {WALL_GAP} m off section 3's left wall (y = {wy:.2f}, "
+                         f"{length:.2f} m of it seen)")
+            cells, expanded, best, short = astar(blocked, cost_of, start, goal=goal, radius=MARGIN / CELL)
+        elif cells is None:
             # Goal line: section 1, any cell AHEAD past the right wall's line (only reachable through the right turn);
             # section 2, any cell AHEAD past the left wall's line (only reachable through the door). A* finds the way.
+            # Section 3, before its left wall is seen: AHEAD forward, until it is.
             # The map only covers what's been seen, so grow it (as unknown space) to include the goal line first
             if self.section == 1:
                 direction, distance = (0.0, -1.0), by - (self.wall_y - AHEAD)
                 goal_text = f"goal line y <= {self.wall_y - AHEAD:.2f} (AHEAD past the right wall's line)"
                 gx, gy = bx, self.wall_y - AHEAD - CELL
-            else:
+            elif self.section == 2:
                 direction, distance = (1.0, 0.0), self.end_x + AHEAD - bx
                 goal_text = f"goal line x >= {self.end_x + AHEAD:.2f} (AHEAD past the left wall's line)"
                 gx, gy = self.end_x + AHEAD + CELL, by
+            else:
+                direction, distance = (1.0, 0.0), AHEAD
+                goal_text = (f"goal line x >= {bx + AHEAD:.2f} (AHEAD forward, looking for section 3's left wall: "
+                             f"longest above so far y = {wy:.2f}, {length:.2f} m)")
+                gx, gy = bx + AHEAD + CELL, by
             rows_before, x0, y0 = self.grid.hits.shape, self.grid.x0, self.grid.y0
             self.grid.fit(np.array([bx, gx]), np.array([by, gy]))
             if self.grid.hits.shape != rows_before or (self.grid.x0, self.grid.y0) != (x0, y0):
@@ -553,15 +587,22 @@ class ObstacleCourseNode(Node):
         if self.exit_on_finish:
             self.finish(reason)
             return
-        self.get_logger().info(f"{reason}. Section 3: face 0 deg, slide to the left wall, then the moving obstacles")
+        self.get_logger().info(f"{reason}. Section 3: into the left pocket, face 0 deg, then the moving obstacles")
         self.move_2D(0.0, 0.0, 0.0)
         self.section, self.path, self.door_locked = 3, None, False
+        self.last_plan = -math.inf # plan on the next scan
+
+    def pocket(self):
+        '''Section 3's left pocket: the body's back MARGIN past the left wall's line, its left side WALL_GAP off
+        section 3's left wall'''
+        return self.end_x + ROBOT_LENGTH / 2 + MARGIN, self.wall3_y - ROBOT_WIDTH / 2 - WALL_GAP
 
     def section_3(self, bx, by, heading):
-        '''The moving obstacles, reactively from the latest scan (no map): face 0 deg; slide left to WALL_GAP from the
-        wall; then for each obstacle, wait until it blocks the path and the path is free again (it has just gone by),
-        and dash forward its distance plus the robot's length plus MARGIN. Done after MOVING_OBSTACLES. From the slide
-        on, the robot follows the wall: parallel to it (a slanted wall), WALL_GAP from it (cancels sideways drift)'''
+        '''The moving obstacles, reactively from the latest scan (no map), once A* has brought the robot into the left
+        pocket: face 0 deg; then for each obstacle, wait until it blocks the path and the path is free again (it has
+        just gone by), and dash forward its distance plus the robot's length plus MARGIN. Done after MOVING_OBSTACLES.
+        Waiting and dashing, the robot follows the wall: parallel to it (a slanted wall), WALL_GAP from it (cancels
+        sideways drift). If nothing blocks the path for GROW_AFTER, it looks GROW_BY times further ahead'''
         if self.points is None:
             self.move_2D(0.0, 0.0, 0.0)
             return
@@ -577,8 +618,9 @@ class ObstacleCourseNode(Node):
                 self.move_2D(0.0, -turn * BODY_X, turn)
                 self.log("s3", 0.5, f"Section 3, facing 0 deg: heading {heading:.1f} deg, turn {turn:+.2f}")
                 return
-            self.step3 = "wall"
-            self.get_logger().info(f"Section 3: facing 0 deg ({heading:.1f}); sliding left to the wall")
+            self.step3, self.wait_since = "wait", time.monotonic()
+            self.get_logger().info(f"Section 3: facing 0 deg ({heading:.1f}) at ({bx:.2f}, {by:.2f}); waiting for "
+                                   f"moving obstacle {self.passed + 1}")
 
         # The left wall beside the body (from its back to its front): the nearest surface on the left, a line fitted
         # to it. The moving obstacles are always ahead of or behind the body, never beside it
@@ -590,10 +632,7 @@ class ObstacleCourseNode(Node):
             angle = math.atan(slope) # the wall's direction, relative to the heading (positive: it bends left)
             gap = offset * math.cos(angle) - ROBOT_WIDTH / 2 # body side to wall, perpendicular to the wall
             turn = 2 * SPEED * math.sin(angle) / LOOKAHEAD # turn parallel to the wall, as pure pursuit would
-            if self.step3 == "wall": # slide in, slowing near the wall but never creeping
-                slide = min(SPEED, max(gap - WALL_GAP, SPEED / 4))
-            else: # hold WALL_GAP: gently, both ways
-                slide = float(np.clip(2 * (gap - WALL_GAP), -SPEED / 2, SPEED / 2))
+            slide = float(np.clip(2 * (gap - WALL_GAP), -SPEED / 2, SPEED / 2)) # hold WALL_GAP: gently, both ways
             self.wall_fix = (turn, slide, gap, math.degrees(angle))
         elif self.wall_fix is None:
             self.move_2D(0.0, 0.0, 0.0)
@@ -605,20 +644,11 @@ class ObstacleCourseNode(Node):
         turn, slide, gap, angle = self.wall_fix
         lateral = slide - turn * BODY_X # plus the term that turns the robot about its body centre
 
-        if self.step3 == "wall": # slide left, parallel to the wall, until WALL_GAP from it
-            if gap > WALL_GAP:
-                self.move_2D(0.0, lateral, turn)
-                self.log("s3", 0.5, f"Section 3, sliding left: {gap:.3f} m from the wall (angle {angle:+.1f} deg), "
-                                    f"slide {slide:.2f}, turn {turn:+.2f}, heading {heading:.1f} deg")
-                return
-            self.step3 = "wait"
-            self.get_logger().info(f"Section 3: {gap:.3f} m from the left wall (angle {angle:+.1f} deg) at ({bx:.2f}, "
-                                   f"{by:.2f}, {heading:.1f} deg); waiting for moving obstacle {self.passed + 1}")
 
         # The robot's path: points ahead of the front, within the body's half-width sideways
         front = (fx > ROBOT_LENGTH / 2) & (np.abs(fy) <= ROBOT_WIDTH / 2)
         ahead = float(fx[front].min()) - ROBOT_LENGTH / 2 if front.any() else math.inf # free space in front of it
-        blocking = ahead <= OBSTACLE_GAP * ROBOT_WIDTH
+        blocking = ahead <= self.reach
         wall_text = f"wall {gap:.3f} m, {angle:+.1f} deg; slide {slide:+.2f}, turn {turn:+.2f}"
 
         if self.step3 == "wait": # stay put (still following the wall) until an obstacle has blocked the path and gone by
@@ -634,8 +664,12 @@ class ObstacleCourseNode(Node):
                 self.get_logger().info(f"Section 3: path free ({ahead:.2f} m ahead); dashing {distance:.3f} m past "
                                        f"obstacle {self.passed + 1} at {DASH_SPEED} m/s")
             else:
+                if self.reach == OBSTACLE_GAP * ROBOT_WIDTH and time.monotonic() - self.wait_since > GROW_AFTER:
+                    self.reach *= GROW_BY # the obstacle may be out of reach: look further, once
+                    self.get_logger().info(f"Section 3: nothing in the path for {GROW_AFTER:.0f} s; now looking "
+                                           f"{self.reach:.3f} m ahead for moving obstacle {self.passed + 1}")
                 self.log("s3", 1.0, f"Section 3: waiting for moving obstacle {self.passed + 1}; path free "
-                                    f"{ahead:.2f} m ahead (blocked within {OBSTACLE_GAP * ROBOT_WIDTH:.3f} m); {wall_text}")
+                                    f"{ahead:.2f} m ahead (blocked within {self.reach:.3f} m); {wall_text}")
             return
 
         # Dash: full speed along the wall until the distance is covered; then stop
@@ -652,7 +686,7 @@ class ObstacleCourseNode(Node):
         if self.passed >= MOVING_OBSTACLES:
             self.finish(f"Section 3 done: past {self.passed} moving obstacles. End of the course")
             return
-        self.step3 = "wait"
+        self.step3, self.wait_since, self.reach = "wait", time.monotonic(), OBSTACLE_GAP * ROBOT_WIDTH
 
     def log(self, key, period, message):
         '''Info log, at most once every period seconds per key (key None: always)'''
@@ -741,9 +775,17 @@ class ObstacleCourseNode(Node):
             self.log("halted", 5.0, f"Holding still: {self.halted}. Ctrl+C to stop")
             return
         bx, by, heading = self.body()
-        if self.section == 3:
+        if self.section == 3 and self.step3 != "pocket":
             self.section_3(bx, by, heading)
             return
+        if self.section == 3 and self.wall3_y is not None: # A* is taking it into the left pocket: there yet?
+            px, py = self.pocket()
+            if math.hypot(bx - px, by - py) < 2 * MARGIN:
+                self.step3, self.path = "face", None
+                self.move_2D(0.0, 0.0, 0.0)
+                self.get_logger().info(f"Section 3: in the left pocket at ({bx:.2f}, {by:.2f}, {heading:.1f} deg), "
+                                       f"section 3's left wall y = {self.wall3_y:.2f}; facing 0 deg")
+                return
         if self.path is None: # no plan yet, or no path right now: stand still and wait for the next plan
             self.move_2D(0.0, 0.0, 0.0)
             self.log("waiting", 1.0, f"No path: standing still at ({bx:.2f}, {by:.2f}, {heading:.1f} deg), replanning "
@@ -769,7 +811,7 @@ class ObstacleCourseNode(Node):
                                        f"wall x = {self.end_x:.3f} from the map ({cells} occupied cells in its 3 "
                                        f"columns, beyond the furthest x reached, {self.max_x:.2f})")
                 self.section = 2
-        elif bx > self.end_x + ROBOT_LENGTH / 2 + MARGIN: # the whole body is past the left wall: through the door
+        elif self.section == 2 and bx > self.end_x + ROBOT_LENGTH / 2 + MARGIN: # whole body past the left wall
             self.section_2_done(f"Section 2 done: crossed the left wall's line (x = {self.end_x:.2f}) with the whole body")
             return
         elif self.door is not None:
