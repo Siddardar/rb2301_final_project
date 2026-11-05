@@ -119,5 +119,5 @@ complicated code so far. The widest-gap version above avoids this.
   one run. It's harmless, but it clutters the log and the motion.
 - **Back-off scope.** The back-off is allowed once per gap search, not once per
   run.
-- **`BODY_X` on the real robot.** Only known for the simulation (0.07 m). It
-  depends on where the Optitrack rigid body's centre is.
+- **`BODY_X` on the real robot.** 0.07 m hasn't been measured on the real
+  robot. It depends on where the Optitrack rigid body's centre is.

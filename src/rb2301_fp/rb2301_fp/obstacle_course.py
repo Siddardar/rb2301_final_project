@@ -10,7 +10,6 @@ from rclpy.node import Node
 from rclpy.logging import set_logger_level, LoggingSeverity
 from rclpy.qos import ReliabilityPolicy, QoSProfile
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 
@@ -63,7 +62,7 @@ def load_frame(robot_number:int) -> tuple:
 
 # The robot
 ROBOT_LENGTH, ROBOT_WIDTH = 0.289, 0.225 # m, CA1
-BODY_X = 0.07 # m, body centre ahead of the pose (simulation: the pose is the rear axle)
+BODY_X = 0.07 # m, body centre ahead of the pose (depends on where the Optitrack rigid body's centre is)
 LIDAR_X, LIDAR_YAW = 0.114, math.pi # m, rad: the LiDAR sits ahead of the pose, mounted backwards (URDF laser_joint)
 
 # What we choose
@@ -219,58 +218,47 @@ def astar(blocked, cost_of, start, goal=None, radius=0.0, direction=None, distan
 
 
 class LidarNode(Node):
+    '''Waits for the first LiDAR scan, so the node only starts once the LiDAR is running'''
     def __init__(self):
-        """Node constructor"""
         super().__init__("LidarNode")
         self.sub_scan = self.create_subscription(LaserScan, "scan", self.sub_scan_callback, 2) # Subscribe to lidar
-        self.is_simulation = None
+        self.ready = False
 
     def sub_scan_callback(self, msg):
-        """Scan subscriber"""
-        if len(msg.ranges) <= 360: 
-            self.is_simulation = True
-        else:
-            self.is_simulation = False
+        self.ready = True
 
 class ObstacleCourseNode(Node):
-    '''Node to navigate obstacle course, using pose from either gazebo odometer or optitrack and lidar scan data'''
-    def __init__(self, is_simulation:bool=True, calibrate:bool=False, snapshots:str=None, exit_on_finish:bool=False):
+    '''Node to navigate the obstacle course, using the pose from Optitrack and the LiDAR scans'''
+    def __init__(self, calibrate:bool=False, snapshots:str=None):
         super().__init__('obstaclecourse')
         self.get_logger().info("Starting ObstacleCourseNode")
 
-        self.is_simulation = is_simulation
         self.calibrate = calibrate # Real robot: only print poses, never drive
         self.raw_pose = None # Pose exactly as Optitrack reported it (real robot only)
         self.frame = self.course = None
         self._ticks = 0
 
-        if is_simulation:
-            self.max_translate_velocity = 1.4
-        else:
-            self.max_translate_velocity = 0.4 # Please keep this in place; 0.3m/s is more than fast enough 
+        self.max_translate_velocity = 0.4 # Please keep this in place; 0.3m/s is more than fast enough 
 
         # Queue of 1: while the node is busy, only the newest scan waits. An older scan would be placed with the robot's
         # current pose, drawn rotated by however much the robot turned since (smeared walls)
         self.sub_scan = self.create_subscription(LaserScan, "scan", self.sub_scan_callback, 1) # Subscribe to LiDAR scan data
 
-        # Subscribe to the dynamic_pose topic from Gazebo that publishes ground-truth pose data
-        if self.is_simulation:
-            self.subscription = self.create_subscription(Odometry, 'odom', self.odometer_callback, 2)
-        else:
-            qos_profile = QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT)
-            # On the Bingda robots ROS_DOMAIN_ID is the robot's number, so the Optitrack topic is picked automatically
-            domain = os.environ.get("ROS_DOMAIN_ID", "")
-            self.robot_number = int(domain) if domain.isdigit() and 1 <= int(domain) <= 99 else 3
-            self.frame, self.course = load_frame(self.robot_number)
-            self.get_logger().info(f"Reading pose from /vrpn_mocap/bingda_{self.robot_number:03d}/pose")
+        # The pose from Optitrack
+        qos_profile = QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT)
+        # On the Bingda robots ROS_DOMAIN_ID is the robot's number, so the Optitrack topic is picked automatically
+        domain = os.environ.get("ROS_DOMAIN_ID", "")
+        self.robot_number = int(domain) if domain.isdigit() and 1 <= int(domain) <= 99 else 3
+        self.frame, self.course = load_frame(self.robot_number)
+        self.get_logger().info(f"Reading pose from /vrpn_mocap/bingda_{self.robot_number:03d}/pose")
 
-            self.map_sub = self.create_subscription( 
-                PoseStamped,
-                f'/vrpn_mocap/bingda_{self.robot_number:03d}/pose',
-                self.optitrack_callback, 
-                qos_profile
-                )
-            
+        self.map_sub = self.create_subscription(
+            PoseStamped,
+            f'/vrpn_mocap/bingda_{self.robot_number:03d}/pose',
+            self.optitrack_callback,
+            qos_profile
+            )
+
         self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10) # Publish to cmd_vel node       
         self.timer = self.create_timer(0.05, self.timer_callback)  # Runs at 20Hz. Can be changed.
 
@@ -310,9 +298,7 @@ class ObstacleCourseNode(Node):
         self.scan_count = 0
         self.last_snapshot = -math.inf # time.monotonic() of the last snapshot
         self.last_plan = -math.inf # time.monotonic() of the last A* plan
-        # Stopping: by default the robot stops and holds (the node keeps running, logging and mapping); with --exit
-        # (the simulation tests), the node exits instead, as it used to
-        self.exit_on_finish = exit_on_finish
+        # Stopping: the robot stops and holds (the node keeps running, logging and mapping) until Ctrl+C
         self.halted = None # reason the robot is holding still for good (e.g. section 2 done)
         self.log_times = {} # key -> last time a rate-limited log line was printed
 
@@ -417,8 +403,6 @@ class ObstacleCourseNode(Node):
                      f"got: ({bxy[0]:.2f}, {bxy[1]:.2f}), {short * CELL:.2f} m short. Robot ({bx:.2f}, {by:.2f}) cell "
                      f"{start}: hits {self.grid.hits[r, c]}, passes {self.grid.passes[r, c]}. Map {occupied.shape[0]} x "
                      f"{occupied.shape[1]}: {int(occupied.sum())} occupied, {int(blocked.sum())} blocked cells")
-            if self.exit_on_finish:
-                self.finish("No path")
             self.path = None # stop and keep replanning on every scan
             return
         self.path = np.array([self.grid.centre(r, c) for r, c in cells])
@@ -430,7 +414,7 @@ class ObstacleCourseNode(Node):
         '''Section 2: the door is a notch in the left wall, a run of beams reaching more than ROBOT_LENGTH further left
         than the beams either side of it (the posts). A door's posts are ends of a wall: in the map, the wall carries on
         past each post, away from the door (an obstacle's edge doesn't). The posts are also on the same wall and far
-        enough apart for the robot plus margins. A set-back wall (the simulation) is only a step up, never a notch, so
+        enough apart for the robot plus margins. A set-back door wall is only a step up, never a notch, so
         the same test works whether or not the door is flush, and on a tilted course'''
         if self.door_locked:
             return
@@ -550,19 +534,13 @@ class ObstacleCourseNode(Node):
         os.replace(name + ".tmp", name)
 
     def finish(self, reason):
-        '''Stop. With --exit, also exit the node (the simulation tests); otherwise hold still for good, still mapping
-        and logging, until Ctrl+C'''
+        '''Stop and hold still for good, still mapping and logging, until Ctrl+C'''
         self.move_2D(0.0, 0.0, 0.0)
         self.get_logger().info(f"Finished: {reason}")
-        if self.exit_on_finish:
-            raise SystemExit
         self.halted = reason
 
     def section_2_done(self, reason):
-        '''Through the door: on to section 3. With --exit (the simulation tests, which cover sections 1 and 2), finish'''
-        if self.exit_on_finish:
-            self.finish(reason)
-            return
+        '''Through the door: on to section 3'''
         self.get_logger().info(f"{reason}. Section 3: face 0 deg, into the left pocket, then the moving obstacles")
         self.move_2D(0.0, 0.0, 0.0)
         self.section, self.path, self.door_locked = 3, None, False
@@ -758,14 +736,6 @@ class ObstacleCourseNode(Node):
         pose = self.pose if pose is None else pose
         return np.array(maze_to_course(pose[0], pose[1], pose[2], self.course)) if self.course else np.array(pose)
 
-    def odometer_callback(self, msg):
-        '''Callback to calculate 2D pose info from Gazebo odomoter. Pose info includes x and y coordinates, as well as heading in degrees.
-        This callback will run everytime the rclpy executor spins'''
-        latest_pose_msg = msg.pose.pose 
-        heading = np.rad2deg(self.yaw_from_quaternion(latest_pose_msg.orientation))
-        self.pose = np.array((latest_pose_msg.position.x, latest_pose_msg.position.y, heading))
-        return self.pose
-
     def move_2D(self, x:float=0.0, y:float=0.0, turn:float=0.0):
         '''Publishes a Twist message to ROS to move a robot. Inputs are x and y linear velocities, as well as turn (z-axis yaw) angular velocity.'''
         twist_msg = Twist()
@@ -780,7 +750,7 @@ class ObstacleCourseNode(Node):
         """Controller loop. Insert path planning and PID control logic here"""
         if self.pose is None:
             print("No pose detected")
-            return # Does not run if no pose received from Odom or Optitrack
+            return # Does not run if no pose received from Optitrack
 
         if self.snapshots and self.start is not None: # map snapshots for tools/view_map.py, once a second
             self.trail.append(tuple(self.body()))
@@ -816,8 +786,6 @@ class ObstacleCourseNode(Node):
         if self.last_move is None or math.hypot(bx - self.last_move[1], by - self.last_move[2]) >= STUCK_DIST:
             self.last_move = (now, bx, by)
         elif now - self.last_move[0] > STUCK_TIME:
-            if self.exit_on_finish:
-                self.finish("Stuck")
             self.log("stuck", 2.0, f"WARNING: moved less than {STUCK_DIST} m in {now - self.last_move[0]:.1f} s, at "
                                    f"({bx:.2f}, {by:.2f}, {heading:.1f} deg)")
 
@@ -869,26 +837,24 @@ def main(args=None):
     arg_parser = argparse.ArgumentParser(description="RB2301 final project")
     arg_parser.add_argument('--calibrate', action='store_true', help="Real robot: only print the Optitrack pose and the maze-frame pose twice a second, never drive")
     arg_parser.add_argument('--snapshots', metavar='DIR', help="Save a map snapshot to DIR once a second, for tools/view_map.py")
-    arg_parser.add_argument('--exit', action='store_true', help="Exit when finished, stuck or with no path (the simulation tests). By default the robot stops and holds, and the node keeps running")
     cli_args, ros_args = arg_parser.parse_known_args(args=args)
     print("Starting obstacle course")
     rclpy.init(args=ros_args)
 
-    # Use lidar scan length to determine if in simulation or not
+    # Wait for the LiDAR
     lidar = LidarNode()
-    while lidar.is_simulation is None:
+    while not lidar.ready:
         rclpy.spin_once(lidar)
-    is_simulation = lidar.is_simulation
     lidar.destroy_node()
 
-    # Start spinning the obstacle node and only stop once SystemExit error is raised within the node callback
-    obstacle = ObstacleCourseNode(is_simulation, cli_args.calibrate, cli_args.snapshots, cli_args.exit)
+    # Spin the obstacle node until Ctrl+C
+    obstacle = ObstacleCourseNode(cli_args.calibrate, cli_args.snapshots)
     try:
         rclpy.spin(obstacle)
     except (SystemExit, KeyboardInterrupt):
         print("Shutting down")
     try:
-        obstacle.move_2D(0.0, 0.0, 0.0) # Gazebo keeps the last velocity
+        obstacle.move_2D(0.0, 0.0, 0.0) # the base keeps the last velocity
     except Exception:
         pass
     obstacle.save_snapshot() # the final state, for tools/view_map.py

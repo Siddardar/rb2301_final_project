@@ -1,9 +1,9 @@
 # Plan
 
-We build the code one part at a time. Each part is tested before the next one
-starts. Part 1 covers section 1, Part 2 section 2. Ideas not yet built are in
-`improvements.md`. The course map at the end is for
-our understanding only; nothing from it goes into the code.
+We build the code one part at a time. Part 1 covers section 1, Part 2 section 2
+and Part 3 section 3. Parts 1 and 2 describe the first, reactive version;
+sections 1 and 2 now use the map and A* in `a-star.md`. Ideas not yet built are
+in `improvements.md`.
 
 ## Part 1: section 1, from the start through the right turn
 
@@ -147,14 +147,8 @@ obstacles in the mouth and dropped in favour of this.
   `STUCK_TIME` (3 s).
 - **No clear heading:** the gap search found no gap on either side.
 
-Stopping raises `SystemExit`, and `main()` sends a zero velocity on the way
-out, because Gazebo keeps the last command.
-
-### Watching it
-
-In the simulation, the node draws the waypoint as a green sphere in the
-Gazebo window, using Gazebo's `/marker` service in the background. That lets
-you see where the robot is aiming. It does nothing on the real robot.
+Stopping holds the robot still, and `main()` sends a zero velocity on the way
+out, because the base keeps the last command.
 
 ### Constants
 
@@ -163,7 +157,7 @@ What describes the robot:
 | Constant | Value | Source |
 |---|---|---|
 | `ROBOT_LENGTH`, `ROBOT_WIDTH` | 0.289 m, 0.225 m | CA1 |
-| `BODY_X` | 0.07 m in the simulation | Body centre ahead of the pose. Measure on the real robot |
+| `BODY_X` | 0.07 m | Body centre ahead of the pose. Measure on the real robot |
 | `LIDAR_X`, `LIDAR_YAW` | 0.114 m, π | URDF `laser_joint` |
 
 What we choose:
@@ -183,31 +177,6 @@ What we choose:
 | `STUCK_TIME`, `STUCK_DIST` | 3 s, 0.05 m | When to give up |
 | `AHEAD_TIME` | 0.5 s | How far ahead the body must still fit before turning |
 
-### Testing
-
-Each run uses a random layout, rerolled if an obstacle spawns on the robot, and
-is capped at 2 minutes. The special cases:
-
-- **Crooked:** the robot spawned at +4° yaw.
-- **Tilted:** the right wall rotated 2.5°, far end further right.
-- **Drawer right:** a drawer beside the robot at the start, face parallel to the
-  wall.
-- **Drawer ahead:** a drawer across the robot's full width, face 16 cm ahead.
-- **Bin in the mouth:** a bin on the right wall's line 20 cm past the corner,
-  leaving a 19 cm gap (too narrow) on the near side and 55 cm on the far side.
-  The deeper obstacles are removed.
-
-Results with the current code (footprint check and back-off included):
-
-| Test | Result | Closest to an obstacle |
-|---|---|---|
-| Tilted (stuck with the turning-circle version) | Done, 27 s | 5.0 cm |
-| Drawer in the mouth (2 mm before the footprint check) | Done, 17 s | 8.1 cm |
-| Drawer ahead | Done, 26 s, gap search facing 0° | 6.3 cm |
-| Crooked | Done, 23 s | 4.8 cm |
-| Random A (coke can and drawer below the mouth) | Done, 31 s: both strafe sides blocked, backed off once, then found the gap | 5.3 cm |
-| Random B | Done, 22 s, but finished heading −123° (see Known issues) | 3.7 cm (bin, about 5.7 cm at LiDAR height) |
-
 ### Known issues
 
 - **Overshoot at the finish.** "Done" only needs the heading within 45° of
@@ -220,7 +189,7 @@ Results with the current code (footprint check and back-off included):
   pass one way one run and the other way the next.
 - **Layouts with no route** (two obstacles staggered across the mouth) still
   stop with `No clear heading`.
-- **`BODY_X`** is only known for the simulation.
+- **`BODY_X`** hasn't been measured on the real robot.
 
 ## Part 2: section 2, from the right turn through the door
 
@@ -230,22 +199,20 @@ Carry on from the end of section 1 (through the right turn, heading roughly
 −90°). Drive down the corridor around obstacles, find the door on the left, and
 drive fully through it. Section 2 is done when the whole body, plus `MARGIN`, is
 past the door's line (body centre `ROBOT_LENGTH / 2 + MARGIN` past it) and the
-heading is within `HEADING_TOL` of the direction through the door. Then stop and
-exit.
+heading is within `HEADING_TOL` of the direction through the door.
 
 Everything stays in the start frame, so "down the corridor" is −90° and "left"
-is 0°. The code has to work both in the simulation, where the door is in a wall
-set back about 0.6 m from the corridor's left wall, and on the real course,
-where the door is roughly flush with it.
+is 0°. On the real course the door is roughly flush with the corridor's left
+wall.
 
 ### Finding the door: two doorposts
 
 The door is a **notch** in the left wall: a narrow stretch where the beams
-suddenly reach much further, bounded on both sides by two posts on the wall. The
-simulation's set-back door wall makes a **step** where the corridor's wall ends:
-the distance jumps up and stays up. A notch jumps up and comes back down to the
-same wall. So the notch test works in both places without knowing any distances.
-It's the same idea as the two doorposts in CA1.
+suddenly reach much further, bounded on both sides by two posts on the wall. A
+set-back door wall would make a **step** instead: the distance jumps up and
+stays up. A notch jumps up and comes back down to the same wall, so the test
+doesn't need to know any distances. It's the same idea as the two doorposts in
+CA1.
 
 Every scan, while the door isn't locked (see below):
 
@@ -321,29 +288,11 @@ pursuit distance and the lock distance.
 
 - **The last obstacle sits near the door.** It's placed around the room's
   corner, so it can block the approach or hide a post.
-- **Moving boxes just behind the door:** the first box's track is only about
-  0.58 m past the door wall in the simulation. The robot stops as soon as it's
-  through.
 - **Grazing angles:** far along a wall, neighbouring beams land further apart.
   The split jump is a robot length, so normal walls don't split into notches.
 - **Tilt on the real course:** the posts must be within `MARGIN` of the end
   wall's x. On a flush real door, a corridor tilted a few degrees from the start
-  heading could put the posts more than `MARGIN` off over 2 m. The simulation
-  doesn't test this, because its door wall is set back 0.6 m.
-
-### Test results
-
-Each run is capped at 2 minutes. Crooked means every wall panel was rotated by
-its own random angle about its centre.
-
-| Test | Result |
-|---|---|
-| Random A, B | Done, about 42 s each. Door within 3 cm of the real one |
-| Random C (drawer blocking the corridor) | Done, 63 s |
-| Random D, E | No route with the margins (gaps of 0.308–0.322 m against 0.325 m needed). These failed with false doors before `left_x` came from the end wall. Not rerun since |
-| Crooked ±3° | Done, 61 s |
-| Crooked ±5° | Done, 56 s |
-| Crooked ±8° | Done, 78 s, after the post-width rule and the gap-search turning rule |
+  heading could put the posts more than `MARGIN` off over 2 m.
 
 ## Part 3: section 3, the moving obstacles
 
@@ -398,8 +347,7 @@ relative to the body, plus the left wall's line from section 1.
      end wall, or the next obstacle coming in. In run 161016 the second dash
      needed 0.61 m, but the end wall was 0.57 m away. The robot pushed against
      the wall, never covered the distance, and so never finished.
-5. **After the second dash,** the course is done: finish (hold still, or exit
-   with `--exit`).
+5. **After the second dash,** the course is done: the robot holds still.
 
 **History:**
 - Version 1 slid left to the wall. In run 142709 it stopped only 4.8 cm from
@@ -412,121 +360,5 @@ relative to the body, plus the left wall's line from section 1.
   spent 14 s with no path while the pocket goal sat up against the door frame.
 
 **Notes:**
-- `move_2D` caps speed at 0.3 m/s on the real robot, so the dash runs at
-  0.3 m/s there.
-- With `--exit` (the simulation tests, which cover sections 1 and 2), section 2
-  still finishes the run.
-
-## The course map (reference only)
-
-All numbers are in the simulation's world frame, in metres. The robot spawns at
-`(0, 0)` facing +x. The map below shows the **nominal** layout: no random
-offsets, and the door at its default position from
-`obstacle_course_world_fp_original.sdf`. Each launch moves parts of it (see
-[What changes each launch](#what-changes-each-launch)).
-
-Scale: one character is 0.1 m across, and one line is 0.2 m down.
-
-```
-   y (m)
-  +0.6  +-----------+-----------+-----------+
-        |                                   |
-        |                                   |
-   0.0  |     R>    s0                      |
-        |                                   |
-        |                                   |
-  -0.6  +-----------+-----------+     s1    |
-                                |           |
-                                |           |
-                                |           |
-                                |     s2    |
-                                |           |
-  -1.8                          |           +-----+-----+-----------+
-                                |                 #     :     :     |
-                                |            door>      :     :     |
-                                |     s3                :     :     |
-                                |                 #     M1    M2    |
-                                |                 #     :     :     |
-                                |                 #     :     :     |
-                                |                 #     :     :     |
-  -3.4                          +-----------+-----+-----+-----------+
-      -0.6    0    0.6         1.8         3.0   3.6   4.2   4.8   5.4   x (m)
-```
-
-| Symbol | Meaning |
-|---|---|
-| `-` `\|` `+` | Fixed walls. Each wall is a 1.2 m panel, 1 cm thick and 0.5 m tall. |
-| `#` | The door wall. The gap in it is the door, 0.4 m wide. |
-| `R>` | Robot start at `(0, 0)`, facing +x. |
-| `s0` to `s3` | Static obstacles, at their nominal positions. |
-| `M1`, `M2` | Moving obstacles. The `:` marks show the line each one slides along. |
-
-## Walls
-
-Each wall's model origin is offset from the panel. A wall at pose
-`(px, py, yaw)` gives these segments:
-
-- yaw 0: from `(px - 0.6, py + 0.6)` to `(px + 0.6, py + 0.6)`
-- yaw 90°: from `(px - 0.6, py - 0.6)` to `(px - 0.6, py + 0.6)`
-
-The nominal segments:
-
-| Wall(s) | Segment | What it is |
-|---|---|---|
-| 3 | x = −0.6, y −0.6 to 0.6 | Back wall behind the start |
-| 1, 4, 6 | y = 0.6, x −0.6 to 3.0 | Corridor 1, left side |
-| 2, 5 | y = −0.6, x −0.6 to 1.8 | Corridor 1, right side |
-| 8 | x = 3.0, y −0.6 to 0.6 | End of corridor 1 |
-| 7, 9, 11 | x = 1.8, y −3.4 to −0.6 | Corridor 2, west side |
-| 10 | x = 3.0, y −1.8 to −0.6 | Corridor 2, east side |
-| 13 | y = −3.4, x 1.8 to 3.0 | Bottom of corridor 2 |
-| 12, 15 | y = −1.8, x 3.0 to 5.4 | Corridor 3, north side |
-| 14, 16 | y = −3.4, x 3.0 to 5.4 | Corridor 3, south side |
-| 17, 18 | x = 5.4, y −3.4 to −1.8 | End wall |
-| configurable_left | x = 3.6, y −2.057 to −0.857 | Door wall above the gap |
-| configurable_right | x = 3.6, y −3.657 to −2.457 | Door wall below the gap |
-
-The door walls are longer than the corridor is wide, so they stick out past
-the corridor walls. The nominal door gap is y −2.457 to −2.057, centred on
-−2.257.
-
-## Key distances
-
-| What | Distance |
-|---|---|
-| Corridor 1 | 1.2 m wide (y −0.6 to 0.6), from the back wall to x = 3.0 |
-| Opening from corridor 1 into corridor 2 | x 1.8 to 3.0, on the right-hand side |
-| Corridor 2 | 1.2 m wide (x 1.8 to 3.0), from y −0.6 down to −3.4 |
-| Corridor 3 | 1.6 m wide (y −3.4 to −1.8), from x 3.0 to 5.4 |
-| Door wall to `M1` line, `M1` to `M2`, `M2` to end wall | 0.6 m each, about 0.57 m of free space after the box and wall thickness |
-| `M1` and `M2` track (box centre) | y −2.0 to −3.2. The box covers y −1.85 to −3.35. |
-| Robot body | 0.289 m long, 0.225 m wide |
-
-## What changes each launch
-
-`obstacle_modifier.py` regenerates `obstacle_course_world_fp.sdf` from the
-original on every `./gz_fp.sh`. Each item has a `randomise_...` switch at the
-top of that file.
-
-| Item | Range | Effect |
-|---|---|---|
-| `x_offset` (zig-zag size) | −0.8 to 0 | Every wall whose model x is above 1.0, and the door, `M1`, `M2`, `s1`–`s3`, shift by this in x. Corridor 1 gets shorter: its end wall moves to x 2.2–3.0. Everything after it moves with it. |
-| `y_offset` (zig-zag size) | −0.6 to 0 | Walls whose model y is below −2.6 (11, 13, 14, 16, 18) shift down by this. Corridor 2 gets longer, and corridor 3 gets wider (1.6 to 2.2 m). The north wall of corridor 3 stays at y = −1.8. The door, `M1`, `M2`, and `s1`–`s3` shift down too. |
-| Door position | Centre y from −2.7 to −2.2, plus `y_offset` | The door width stays at 0.4 m. Door x is 3.6 + `x_offset`. |
-| Obstacle speed | Half-period 2 s to 6 s, each box separately | 1.2 m each way, so 0.2 to 0.6 m/s. The comment in the code says 2 to 5 s, but the code gives 2 to 6 s. |
-| Static obstacle positions | ±0.4 m in x, ±0.3 m in y | `s0` nominal `(0.6, 0)`. `s1`–`s3` nominal `(2.4, −0.6)`, `(2.4, −1.4)`, `(2.4, −2.4)`, plus both offsets. |
-| Static obstacle type | One of three, chosen at random for each | Coke can (0.06 m diameter, 0.145 m tall), drawer (0.41 × 0.48 m), or litter bin (about 0.45 m across). |
-
-### Edge cases worth knowing
-
-- `s0` can land as close as x = 0.2, right in front of the robot at the start.
-- A litter bin offset by 0.4 m in corridor 2 almost touches a wall, but the
-  other side always has about 0.75 m free.
-- The box tracks shift down with `y_offset`, but the north wall of corridor 3
-  doesn't. That leaves a strip along y = −1.8 that the boxes never enter, of
-  width 0.05 − `y_offset` (up to 0.65 m). Once `y_offset` is below about
-  −0.18, the strip is wider than the robot. This is a simulation artefact, so
-  don't rely on it for the real course.
-- With the door at its lowest and `y_offset` near −0.6, a slit of up to 0.1 m opens
-  between the top of the upper door wall and the corridor 3 north wall. The
-  robot can't fit through it, but the LiDAR sees through it.
+- `move_2D` caps speed at `max_translate_velocity`, so the dash can't go faster
+  than that.

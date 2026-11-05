@@ -8,52 +8,9 @@ Everything you write goes in one file, inside `ObstacleCourseNode.timer_callback
 src/rb2301_fp/rb2301_fp/obstacle_course.py
 ```
 
-What you have: `self.pose` (`[x, y, heading]`, metres and degrees, from Gazebo odometry or Optitrack), `self.last_scan` (LiDAR ranges, set once the first scan arrives), `self.move_2D(x, y, turn)` to drive, and `self.is_simulation`, which is set automatically from the LiDAR scan size.
+What you have: `self.pose` (`[x, y, heading]`, metres and degrees, from Optitrack), `self.last_scan` (LiDAR ranges, set once the first scan arrives) and `self.move_2D(x, y, turn)` to drive.
 
-## Set up (simulation)
-
-Requirements: Ubuntu with ROS 2 Jazzy and Gazebo Harmonic, `ros-jazzy-ros-gz`, numpy, and your existing RB2301 workspace (the folder containing `src/`, e.g. `~/Documents/rb2301`).
-
-1. Get this repo: `git clone https://github.com/rudra-8000/rb2301_final_project.git` (or Code > Download ZIP).
-2. Copy `fp.sh` and `gz_fp.sh` into the workspace folder, next to `src/`.
-3. Copy `src/rb2301_fp` and `src/rb2301_gz` into your workspace's `src/`. The new `rb2301_gz` replaces your old one and has the worlds and launch files for CA1, CA2 and the final project.
-4. Build:
-
-```bash
-cd ~/Documents/rb2301
-chmod +x fp.sh gz_fp.sh
-source /opt/ros/jazzy/setup.bash
-colcon build --symlink-install
-```
-
-`--symlink-install` means edits to `obstacle_course.py` take effect without rebuilding.
-
-## Run
-
-Two terminals, both in the workspace folder:
-
-```bash
-./gz_fp.sh     # terminal 1: Gazebo. Wait until the course and robot appear
-./fp.sh        # terminal 2: your node
-```
-
-The goal is to get past the moving obstacles. To start the robot somewhere else (for example past the gate), change `x:=` and `y:=` in `gz_fp.sh`; a commented example is in the file. Stop with `Ctrl+C`.
-
-The unchanged starter code just drives forward at 0.1 m/s.
-
-## The simulation map
-
-- Each time you launch, the map is randomised from `obstacle_modifier.py`: gate position, zig-zag size, obstacle speed, and the position of the static obstacles. Switch each one on or off with the `randomise_...` variables at the top of that file.
-- The untouched map is `obstacle_course_world_fp_original.sdf`. Do not edit it; the launched map is generated from it.
-- The moving obstacles have no collision in the simulation.
-
-## Problems
-
-- `Permission denied` on a `.sh` file: `chmod +x fp.sh gz_fp.sh`.
-- Gazebo hangs on "Requesting list of world names": an old Gazebo is still running. `pkill -9 ruby`, then run `./gz_fp.sh` again.
-- Nothing happens when you run `./fp.sh`: Gazebo has to be fully loaded first (check terminal 1 is still running). The node waits for the LiDAR before it starts.
-- `ros2: command not found`: `source /opt/ros/jazzy/setup.bash`. Run the scripts from the workspace folder (the one with `install/`).
-- Gazebo window black, slow or crashing (virtual machine, no GPU): in `src/rb2301_gz/launch/fp_gazebo.launch.py` set `LIBGL_ALWAYS_SOFTWARE` to `"1"`.
+This branch (`irl`) is for the real robot only: the Gazebo package, the simulation scripts and the simulation-only code paths are removed. The simulation is on `fresh`.
 
 ## Real robot
 
@@ -89,12 +46,14 @@ vrpn                    # alias for ros2 launch vrpn_mocap client.launch.yaml se
 cd ~/Downloads/rb2301_fp_<group> && ./fp.sh
 ```
 
+`./robot-test.sh NN` does the copy, build and launch in one step (`./robot-test.sh -h` for options; `--map` shows the map live with `tools/view_map.py`).
+
 Add `--calibrate` to the last command (`./fp.sh --calibrate`) to only print your pose and never drive. Stay out of the Optitrack area while the robot runs.
 
-What is different from the simulation:
+Notes:
 
 - **Pose frame.** On the real robot `self.pose` is in the **CA2 maze frame**: metres from the corner of the CA2 maze, heading 0 along its +x axis and +90 along +y (counter-clockwise positive). The mapping from Optitrack to that frame is in `src/rb2301_fp/rb2301_fp/optitrack_variables.config`, already filled in. Don't edit it. If the calibration changes you will get a new file to drop in.
-- **Course coordinates.** In the simulation the robot starts at `(0, 0)` facing +x. If you want the same numbers on the real robot, `self.to_course()` converts a pose from the CA2 maze frame to the course frame. It needs the position of the course start point in the maze frame (`[course]` in the config), which is not set yet, so for now it returns the pose unchanged.
+- **Course coordinates.** The node works relative to its start pose, so it doesn't need course coordinates. If you want them anyway, `self.to_course()` converts a pose from the CA2 maze frame to the course frame. It needs the position of the course start point in the maze frame (`[course]` in the config), which is not set yet, so for now it returns the pose unchanged.
 - **Robot number.** The node reads the Optitrack topic of its own robot from `ROS_DOMAIN_ID` (already set on each robot) and prints it at start-up (`/vrpn_mocap/bingda_0NN/pose`).
 - **Rigid bodies** are created in Motive with the robot facing +y of the CA2 maze. If you reset one, face the robot +y first.
 - **Checking the pose.** Run the node with `--calibrate`, for example `./fp.sh --calibrate` on the robot. It prints the raw Optitrack pose and the maze-frame pose twice a second and never sends a drive command, so you can move the robot by hand and read off coordinates (for example the position of the gate). Start `rplidar` first, otherwise the node waits for the LiDAR.

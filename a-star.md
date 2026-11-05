@@ -52,16 +52,15 @@ Only how the robot gets to each goal changes.
   - **Goal area:** any cell within a radius of a point. Being near the point is
     good enough, so an obstacle sitting exactly on it doesn't make the goal
     unreachable.
-- **No path:** stop, log the details, and keep replanning. On the real robot
-  nothing exits early. With `--exit` (simulation tests only), it exits with
-  `No path`.
+- **No path:** stop, log the details, and keep replanning. Nothing exits
+  early.
 
 ## Goals
 
 | Stage | Goal |
 |---|---|
 | Section 1, turn not found | Goal line, 0° |
-| Section 1, turn found | Goal line: any cell `AHEAD` below the right wall's line. The scan waypoint is only the handover marker, drawn in Gazebo, so A* finds its own way through the opening and round anything in its mouth |
+| Section 1, turn found | Goal line: any cell `AHEAD` below the right wall's line. A* finds its own way through the opening and round anything in its mouth |
 | Section 2, door not found (or no path to it) | Goal line: any cell `AHEAD` past the left wall's line (`x ≥ end_x + AHEAD`). It's only reachable through the door, so A* finds the door from the map even before the door search does |
 | Section 2, door found | Area within `MARGIN` of the line-up point, `LOOKAHEAD` in front of the door's centre |
 | Section 2, door locked (inside the line-up area or past it) | No A*: drive straight along the door's centre line, as before. A 0.4 m door leaves only 7.5 cm of free path once both sides are inflated, too little for a grid |
@@ -152,9 +151,9 @@ you can push the robot through the course by hand and watch the map form.
 
 ## Speed on the real robot
 
-On the robot, one plan (including inflating the map) took 150–375 ms, against
-about 20 ms in the simulation. Scans and the 20 Hz control loop share one
-thread, so planning on every scan starved both. So:
+On the robot, one plan (including inflating the map) took 150–375 ms. Scans and
+the 20 Hz control loop share one thread, so planning on every scan starved
+both. So:
 
 - **Plans every `REPLAN_PERIOD` (0.5 s).** Every scan still goes into the map,
   and the robot follows its current path between plans.
@@ -162,26 +161,6 @@ thread, so planning on every scan starved both. So:
   scan that waited longer would be placed with the robot's newer pose, rotated by
   however much the robot had turned since, which smeared walls into arcs.
 - **Snapshots by the clock** (every 1 s), not by control ticks, which ran late.
-
-## Test results
-
-Three random layouts. The first try had no clearance cost, used `LOOKAHEAD` for
-the path, and gave the turn's waypoint as an area goal:
-
-| Layout | First try | Now |
-|---|---|---|
-| 1 | Stuck near a drawer in the mouth | Done, 40 s, 14 cm closest to an obstacle (needed the lock fix below) |
-| 2 | Done, but touched a bin and a drawer | Done, 40 s, 8.5 cm closest |
-| 3 | Stuck, in contact with a drawer in the mouth | Done, 43 s, 6.7 cm closest |
-
-**Lock fix.** The line-up point is `LOOKAHEAD` in front of the door, and the
-door used to lock only strictly closer than that. The robot reached its A* goal
-exactly there, its path shrank to one point, and it stopped. The door now locks
-once the robot is inside the line-up area (`along > −(LOOKAHEAD + MARGIN)`).
-
-**Door frame clearance is about 3–4 cm.** The robot arrives at the line-up point
-at an angle (one run at −38°). The centre-line drive then has only 0.4 m to
-straighten up, so it enters the door slightly off-centre.
 
 ## What it removes
 
