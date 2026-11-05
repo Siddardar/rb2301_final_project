@@ -78,10 +78,10 @@ OCC_WEIGHT = 4 # a cell is occupied while hits * OCC_WEIGHT > passes: a wall see
                # along it) stays occupied, a stray hit in open space still clears
 HEADING_TOL = 45.0 # deg: through the turn / door and this close to its direction counts as done
 STUCK_TIME, STUCK_DIST = 3.0, 0.05 # s, m: moving less than this in this long means stuck
-INFLATE = ROBOT_WIDTH / 2 + MARGIN / 2 # m: occupied cells are grown by this; the body centre stays outside. Only half
-                                       # the margin is hard, so a door barely wider than the robot stays open in the map
-CLEAR = ROBOT_WIDTH / 2 + 3 * MARGIN # m: free cells closer than this to an occupied one cost CLEARANCE_COST times more,
-CLEARANCE_COST = 3.0                 # so paths keep the full margin and more wherever there's room
+INFLATE = 0.15 # m (6 cells): occupied cells are grown by this, as a square; the body centre stays outside
+CLEAR = ROBOT_WIDTH / 2 + 3 * MARGIN # m: free cells closer than this to an occupied one cost more, the closer the more:
+CLEARANCE_COST = 6.0 # up to this many times a normal step at the blocked edge, falling to 1 at CLEAR (squared), so the
+                     # cheapest line through a gap is its middle, not along one side
 UNKNOWN_COST = 2.0 # a step into a cell never seen costs this many times more, so paths prefer space actually seen
 PATH_LOOKAHEAD = 0.25 # m, pure pursuit along the A* path (shorter than LOOKAHEAD, so it cuts corners less)
 REPLAN_PERIOD = 0.5 # s between A* plans. Mapping still uses every scan; planning on every scan was too slow on the robot
@@ -90,6 +90,7 @@ OBSTACLE_GAP = 1.5 # robot widths: something in the robot's path this close to i
 DASH_SPEED = 0.4 # m/s past a moving obstacle (move_2D caps it at 0.3 on the real robot)
 MOVING_OBSTACLES = 2 # the course ends once the robot is past this many
 WALL_GAP = 0.10 # m between the body's left side and section 3's left wall, which the robot follows (room for drift)
+GROW_AFTER, GROW_BY = 2.0, 1.5 # s, times: every GROW_AFTER with nothing blocking the path, the reach grows by GROW_BY
 
 
 class Grid:
@@ -137,17 +138,20 @@ class Grid:
         self.hits.reshape(-1)[hits] += 1
         return grew
 
-    def grown(self, radius):
-        '''Occupied cells grown by radius (m)'''
-        occupied = self.hits * OCC_WEIGHT > self.passes
-        rows, cols = np.nonzero(occupied)
-        out = np.zeros_like(occupied)
-        k = int(math.ceil(radius / CELL))
-        for dr in range(-k, k + 1):
-            for dc in range(-k, k + 1):
-                if math.hypot(dr, dc) * CELL <= radius:
-                    out[np.clip(rows + dr, 0, out.shape[0] - 1), np.clip(cols + dc, 0, out.shape[1] - 1)] = True
-        return out
+    def distance(self, limit):
+        '''Each cell's distance to the nearest occupied cell, in cells, measured as a square (the larger of the row and
+        column offsets): grown one cell at a time, up to limit cells; further than that is limit + 1'''
+        grown = self.hits * OCC_WEIGHT > self.passes
+        dist = np.where(grown, 0, limit + 1)
+        for d in range(1, limit + 1):
+            rows = grown.copy() # one cell in every direction: rows, then columns, makes a 3 x 3 square
+            rows[1:] |= grown[:-1]
+            rows[:-1] |= grown[1:]
+            grown = rows.copy()
+            grown[:, 1:] |= rows[:, :-1]
+            grown[:, :-1] |= rows[:, 1:]
+            dist[grown & (dist > limit)] = d
+        return dist
 
     def wall_x(self, beyond):
         '''x of the longest wall across the map (running along y) beyond x = beyond: the column, past that x, with the
@@ -161,15 +165,17 @@ class Grid:
         return float(xs[k]), int(count[k])
 
     def blocked(self, bx, by):
-        '''Cells the body centre can't be in (occupied cells grown by INFLATE, except around the robot itself), and the
-        cost of stepping into each cell: CLEARANCE_COST within CLEAR of an occupied cell, UNKNOWN_COST if never seen'''
-        blocked = self.grown(INFLATE)
-        k = int(math.ceil(INFLATE / CELL))
+        '''Cells the body centre can't be in (within INFLATE of an occupied cell, as a square, except around the robot
+        itself), and the cost of stepping into each cell: up to CLEARANCE_COST near the blocked cells, falling to 1 at
+        CLEAR; times UNKNOWN_COST if never seen'''
+        k = int(round(INFLATE / CELL))
+        dist = self.distance(int(math.ceil(CLEAR / CELL)))
+        blocked = dist <= k
         r, c = self.cell(bx, by)
         blocked[max(r - k, 0):r + k + 1, max(c - k, 0):c + k + 1] = False # the robot is standing there
-        cost = np.ones(blocked.shape)
-        cost[(self.hits == 0) & (self.passes == 0)] = UNKNOWN_COST
-        cost[self.grown(CLEAR) & ~blocked] *= CLEARANCE_COST
+        near = np.clip((CLEAR - dist * CELL) / (CLEAR - INFLATE), 0.0, 1.0) # 1 at the blocked edge, 0 from CLEAR on
+        cost = 1.0 + (CLEARANCE_COST - 1.0) * near ** 2
+        cost[(self.hits == 0) & (self.passes == 0)] *= UNKNOWN_COST
         return blocked, cost
 
 
@@ -292,6 +298,9 @@ class ObstacleCourseNode(Node):
         self.passed = 0 # moving obstacles dashed past
         self.gap = None # closest the current obstacle came to the front while blocking the path (m); None: not seen yet
         self.dash = None # (start x, start y, distance) of the current dash
+        self.reach = OBSTACLE_GAP * ROBOT_WIDTH # m: something in the path this close to the front is blocking it
+        self.grown_at = None # time.monotonic() the reach was last set
+        self.free_ahead = 0.0 # most free space seen in front during this wait: static things (the end wall) are there
         self.wall_fix = None # (turn, slide, gap, angle) from the last scan that saw the left wall beside the robot
         # Map snapshots for tools/view_map.py (--snapshots DIR)
         self.snapshots = snapshots
@@ -640,6 +649,7 @@ class ObstacleCourseNode(Node):
                                     f"{by:.2f}), heading {heading:.1f} deg")
                 return
             self.step3 = "wait"
+            self.reach, self.grown_at, self.free_ahead = OBSTACLE_GAP * ROBOT_WIDTH, time.monotonic(), 0.0
             self.get_logger().info(f"Section 3: in the left pocket, {gap:.3f} m from the wall (angle {angle:+.1f} deg) "
                                    f"at ({bx:.2f}, {by:.2f}, {heading:.1f} deg); waiting for moving obstacle "
                                    f"{self.passed + 1}")
@@ -655,7 +665,7 @@ class ObstacleCourseNode(Node):
         # The robot's path: points ahead of the front, within the body's half-width sideways
         front = (fx > ROBOT_LENGTH / 2) & (np.abs(fy) <= ROBOT_WIDTH / 2)
         ahead = float(fx[front].min()) - ROBOT_LENGTH / 2 if front.any() else math.inf # free space in front of it
-        blocking = ahead <= OBSTACLE_GAP * ROBOT_WIDTH
+        blocking = ahead <= self.reach
         wall_text = f"wall {gap:.3f} m, {angle:+.1f} deg; slide {slide:+.2f}, turn {turn:+.2f}"
 
         if self.step3 == "wait": # stay put (still following the wall) until an obstacle has blocked the path and gone by
@@ -671,8 +681,19 @@ class ObstacleCourseNode(Node):
                 self.get_logger().info(f"Section 3: path free ({ahead:.2f} m ahead); dashing {distance:.3f} m past "
                                        f"obstacle {self.passed + 1} at {DASH_SPEED} m/s")
             else:
+                # Nothing yet: maybe the obstacle is out of reach. Every GROW_AFTER, look GROW_BY further, but stay
+                # MARGIN short of the most free space seen ahead (static: the end wall), or it would block for good
+                self.free_ahead = max(self.free_ahead, min(ahead, 10.0))
+                if time.monotonic() - self.grown_at > GROW_AFTER:
+                    reach = min(self.reach * GROW_BY, self.free_ahead - MARGIN)
+                    self.grown_at = time.monotonic()
+                    if reach > self.reach:
+                        self.reach = reach
+                        self.get_logger().info(f"Section 3: nothing in the path for {GROW_AFTER:.0f} s; now looking "
+                                               f"{self.reach:.3f} m ahead for moving obstacle {self.passed + 1} (most "
+                                               f"free ahead {self.free_ahead:.2f} m)")
                 self.log("s3", 1.0, f"Section 3: waiting for moving obstacle {self.passed + 1}; path free "
-                                    f"{ahead:.2f} m ahead (blocked within {OBSTACLE_GAP * ROBOT_WIDTH:.3f} m); {wall_text}")
+                                    f"{ahead:.2f} m ahead (blocked within {self.reach:.3f} m); {wall_text}")
             return
 
         # Dash: full speed along the wall until the distance is covered, or something is MARGIN ahead (the course's
@@ -693,6 +714,7 @@ class ObstacleCourseNode(Node):
             self.finish(f"Section 3 done: past {self.passed} moving obstacles. End of the course")
             return
         self.step3 = "wait"
+        self.reach, self.grown_at, self.free_ahead = OBSTACLE_GAP * ROBOT_WIDTH, time.monotonic(), 0.0
 
     def log(self, key, period, message):
         '''Info log, at most once every period seconds per key (key None: always)'''

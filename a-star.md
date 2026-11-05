@@ -22,15 +22,25 @@ Only how the robot gets to each goal changes.
 
 ## Planning
 
-- **Blocked cells:** occupied cells grown by `INFLATE` = `ROBOT_WIDTH / 2 +
-  MARGIN / 2` (0.1375 m). Only half the margin is hard, so a door barely wider
-  than the robot stays open in the map. Cells around the robot itself are
+- **Distance to obstacles:** every cell's distance to the nearest occupied
+  cell, measured as a square (the larger of the row and column offsets). It's
+  found by growing the occupied cells one cell at a time, up to `CLEAR`, which
+  is fast.
+- **Blocked cells:** within `INFLATE` (0.15 m, 6 cells) of an occupied cell, so
+  each occupied cell blocks a 13 × 13 square. Cells around the robot itself are
   unblocked, so it can plan away from something it's next to.
-- **Clearance cost:** a free cell closer than `CLEAR` = `ROBOT_WIDTH / 2 + 3 ×
-  MARGIN` (0.2625 m) to an occupied cell costs `CLEARANCE_COST` (3) times as
-  much to cross. Paths keep the full margin and more when there's room, but can
-  still squeeze through narrow gaps. Without it, the path hugged the blocked
-  edge, and the robot touched obstacles in two of three runs.
+  - The square reaches √2 times further diagonally (0.21 m): more room round
+    obstacle corners, where the robot's own corners hit.
+  - The cost is that gaps running diagonally close sooner.
+- **Graded clearance cost:** a free cell closer than `CLEAR` (0.2625 m) costs
+  `1 + (CLEARANCE_COST − 1) × ((CLEAR − d) / (CLEAR − INFLATE))²` times a normal
+  step, where d is its distance. That's 4.0× for the first free cell (7 cells
+  out), then 2.5×, 1.6×, 1.06×, and 1× from 11 cells on.
+  - Each cell is priced by its nearest obstacle, so in a gap the middle is the
+    cheapest line, not one edge.
+  - The old flat 3× band priced every cell in a tight gap the same, so the path
+    took the shortest line, along one edge. In run 145431 the body centre came
+    0.11 m from one side of a 0.46 m passage.
 - **Unknown cost:** a cell never seen (no hits, no passes) costs `UNKNOWN_COST`
   (2) times as much, so paths prefer space the LiDAR has actually seen. It's
   still passable: the goal lines lie in unseen space.
@@ -180,9 +190,10 @@ straighten up, so it enters the door slightly off-centre.
 
 ## Known risks
 
-- **Inflation by the half-width plus half the margin only.** The robot's
-  corners can still swing closer than `MARGIN` on tight turns; the clearance
-  cost keeps paths away when there's room.
+- **Inflation of 0.15 m.** That's more than the half-length (0.1445 m), but
+  less than the half-diagonal (0.183 m) straight out from a wall. So a robot
+  corner can still swing into a wall when turning in place right against it.
+  The graded cost keeps paths off the blocked edge when there's room.
 - **The left wall from the map** is only as good as the map. A big pose jump
   during section 1 would smear the end wall over many columns. The `Section 1
   done` log line prints `end_x` and how many cells it was based on (about 110

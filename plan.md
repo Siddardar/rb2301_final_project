@@ -385,6 +385,11 @@ relative to the body, plus the left wall's line from section 1.
    - **Wait** in place until something in the path is within the reach of the
      front: `OBSTACLE_GAP` (1.0) robot widths. That's the obstacle blocking. Then
      wait until the path is free again: it has just gone by.
+   - **Reach:** if nothing blocks the path for `GROW_AFTER` (2 s), the reach
+     grows by `GROW_BY` (1.5), and again every 2 s after that. It stops
+     `MARGIN` short of the most free space seen ahead during the wait, because
+     the end wall is static and would otherwise block forever. It resets to
+     `OBSTACLE_GAP` robot widths at the start of each wait.
    - **Dash** along the wall at `DASH_SPEED` (0.4 m/s) for the obstacle's
      distance plus the robot's length plus `MARGIN`. The distance is the
      furthest it was from the front while blocking. The obstacles are sheets of
