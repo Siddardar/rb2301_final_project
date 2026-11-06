@@ -332,17 +332,30 @@ relative to the body, plus the left wall's line from section 1.
    - **The path:** scan points ahead of the body's front, and within the body's
      half-width sideways.
    - **Wait** in place until something in the path is within the reach of the
-     front: `OBSTACLE_GAP` (1.0) robot widths. That's the obstacle blocking. Then
-     wait until the path is free again: it has just gone by.
+     front: `OBSTACLE_GAP` (1.5) robot widths. That's the obstacle, seen for
+     the first time, and how far ahead it is gives its line.
    - **Reach:** if nothing blocks the path for `GROW_AFTER` (2 s), the reach
      grows by `GROW_BY` (1.5), and again every 2 s after that. It stops
      `MARGIN` short of the most free space seen ahead during the wait, because
      the end wall is static and would otherwise block forever. It resets to
      `OBSTACLE_GAP` robot widths at the start of each wait.
+   - **Move up** along the wall at `SPEED` until the front is `APPROACH_GAP`
+     (0.15 m) from the obstacle's line. This is measured by the pose, because
+     the obstacle may have left the path by then. It stops early if anything
+     in the path is within `APPROACH_GAP`. If the obstacle is already within
+     `APPROACH_GAP + MARGIN`, the robot doesn't move up.
+     - **Why:** from where the robot first saw it, the dash was too long to
+       finish before the obstacle came back.
+   - **Wait close** until something in the path is within
+     `APPROACH_GAP + 2·MARGIN` (0.25 m). That's the obstacle on its next pass.
+     The extra `MARGIN` allows for the move-up stopping a little short. Then
+     wait until the path is free again: it has just gone by. If it's still in
+     the path when the robot arrives, the dash starts as soon as it clears.
    - **Dash** along the wall at `DASH_SPEED` (0.4 m/s) for the obstacle's
-     distance plus the robot's length plus `MARGIN`. The distance is the
-     furthest it was from the front while blocking. The obstacles are sheets of
-     cardboard, so their depth doesn't count. Then stop.
+     distance plus the robot's length plus `MARGIN`: about 0.5 m from close
+     up. The distance is the furthest it was from the front while blocking.
+     The obstacles are sheets of cardboard, so their depth doesn't count. Then
+     stop.
    - **Stop early** if something in the path is within `MARGIN`: the course's
      end wall, or the next obstacle coming in. In run 161016 the second dash
      needed 0.61 m, but the end wall was 0.57 m away. The robot pushed against
